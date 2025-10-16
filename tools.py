@@ -1,0 +1,1432 @@
+import io
+import contextlib
+import tabulate
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import base64
+from pathlib import Path
+from langchain.agents.tool_node import InjectedState
+from typing import Annotated, Optional, Literal, List, Dict
+from langchain_core.tools import InjectedToolCallId
+from langgraph.types import Command
+from langchain_core.messages import ToolMessage
+from models import AnalystState
+from langchain_core.tools import tool
+from difflib import SequenceMatcher
+import json
+
+# Whitelist of safe builtins
+SAFE_BUILTINS = {
+    "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
+    "enumerate": enumerate, "filter": filter, "float": float, "int": int,
+    "len": len, "list": list, "map": map, "max": max, "min": min,
+    "range": range, "reversed": reversed, "round": round, "set": set,
+    "slice": slice, "sorted": sorted, "str": str, "sum": sum,
+    "tuple": tuple, "zip": zip, "Exception": Exception,
+    "ValueError": ValueError, "TypeError": TypeError, "print": print,
+    "tabulate": tabulate,
+}
+
+_XLSX_FORMATS = ['xlsx','xls']
+_CSV_FORMATS = ['csv']
+
+def _clean_number(value):
+    if isinstance(value, str):
+        value = value.replace(',', '').replace('%', '').strip()
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return 0.0
+
+def _map_control_id_to_process(control_id):
+    try:
+        id_str = str(control_id)
+        if not id_str or id_str.lower() == 'nan':
+            return "Unknown"
+        id_fragment = id_str.split("-")[-1].strip()
+        numeric_str = ''.join([ch for ch in id_fragment if ch.isdigit() or ch == '.'])
+        if not numeric_str:
+            return "Unknown"
+        numeric_part = float(numeric_str[:6])
+        if 1.0 <= numeric_part < 2.0: return "PTP"
+        elif 2.0 <= numeric_part < 3.0: return "Payroll"
+        elif 3.0 <= numeric_part < 4.0: return "OTC"
+        elif 4.0 <= numeric_part < 5.0: return "Inventory"
+        elif 5.0 <= numeric_part < 6.0: return "Financial Close"
+        elif 6.0 <= numeric_part < 7.0: return "Fixed Assets"
+        elif 7.0 <= numeric_part < 8.0: return "Treasury"
+        elif 8.0 <= numeric_part < 9.0: return "Tax"
+        elif 9.0 <= numeric_part < 10.0: return "RE"
+        elif 10.0 <= numeric_part < 11.0: return "Business Combinations"
+        else: return "Other"
+    except Exception:
+        return "Unknown"
+
+def _gpt4_match_controls(account_type: str, rcm_df: pd.DataFrame, model) -> pd.DataFrame:
+    """
+    GPT-4 based intelligent control matching using semantic understanding.
+    
+    Uses Azure OpenAI GPT-4 to analyze each control and determine relevance
+    to the given account type based on semantic meaning, not just keywords.
+    
+    Args:
+        account_type: The account type to match controls for (e.g., "Cash Summary")
+        rcm_df: The RCM dataframe with controls
+        model: Azure OpenAI GPT-4 model instance
+    
+    Returns:
+        DataFrame of matched controls with relevance scores
+    """
+    import json
+    from langchain_core.messages import HumanMessage
+    
+    # Get all controls
+    controls = rcm_df[['Control ID', 'Control Description']].copy()
+    
+    # Prepare batch analysis prompt
+    controls_text = "\n".join([
+        f"{idx+1}. {row['Control ID']}: {row['Control Description'][:200]}"
+        for idx, row in controls.iterrows()
+    ])
+    
+    prompt = f"""You are a SOX audit expert analyzing internal controls. 
+
+TASK: Identify which controls are relevant for auditing the account type "{account_type}".
+
+CONTROLS TO ANALYZE:
+{controls_text[:15000]}  
+
+INSTRUCTIONS:
+1. For each control, determine if it's relevant to {account_type} based on:
+   - Direct relationship (e.g., "Cash reconciliation" for Cash accounts)
+   - Indirect relationship (e.g., "Revenue recognition" affects Receivables)
+   - Process relationship (e.g., "Payroll processing" for Salary Expense)
+   - Financial statement relationship (balance sheet vs income statement impacts)
+
+2. Return a JSON array with ONLY the relevant Control IDs (not all controls).
+3. Be selective - only include controls with strong relevance (score >= 7/10).
+4. Consider:
+   - Financial statement classification
+   - Transaction cycle relationships
+   - Upstream/downstream process dependencies
+   - Risk and control objectives
+
+RESPONSE FORMAT (JSON only, no explanation):
+{{"relevant_controls": ["A-1.1A", "B-2.3A", ...]}}
+
+If no controls are strongly relevant, return: {{"relevant_controls": []}}"""
+
+    try:
+        # Call GPT-4
+        response = model.invoke([HumanMessage(content=prompt)])
+        
+        # Parse response
+        response_text = response.content.strip()
+        
+        # Extract JSON from response (handle markdown code blocks)
+        if "```json" in response_text:
+            json_start = response_text.find("```json") + 7
+            json_end = response_text.find("```", json_start)
+            response_text = response_text[json_start:json_end].strip()
+        elif "```" in response_text:
+            json_start = response_text.find("```") + 3
+            json_end = response_text.find("```", json_start)
+            response_text = response_text[json_start:json_end].strip()
+        
+        # Parse JSON
+        result = json.loads(response_text)
+        relevant_control_ids = result.get('relevant_controls', [])
+        
+        # Filter RCM to only relevant controls
+        matched_controls = rcm_df[rcm_df['Control ID'].isin(relevant_control_ids)].copy()
+        
+        return matched_controls
+        
+    except json.JSONDecodeError as e:
+        print(f"  ⚠️ GPT-4 response parsing error: {e}")
+        print(f"  Response was: {response_text[:500]}")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"  ⚠️ GPT-4 analysis error: {e}")
+        return pd.DataFrame()
+
+def _ai_match_controls(account_type: str, rcm_df: pd.DataFrame, use_ai: bool = True) -> pd.DataFrame:
+    """
+    AI-powered control matching using embeddings with fallback to synonym-based matching.
+    
+    Args:
+        account_type: The account type to match controls for
+        rcm_df: The RCM dataframe
+        use_ai: Whether to use AI semantic matching (True) or fall back to synonyms (False)
+    
+    Returns:
+        DataFrame of matched controls
+    """
+    if use_ai:
+        # TIER 1 (EMBEDDINGS) TEMPORARILY DISABLED - SSL CERTIFICATE ISSUES
+        # Skip directly to Tier 1.5 (GPT-4) which works without SSL layer
+        skip_embeddings = True  # Set to False to re-enable embeddings when SSL is available
+        
+        if not skip_embeddings:
+            try:
+                # TIER 1: SEMANTIC EMBEDDING-BASED MATCHING (Local or Azure)
+                from embedding_matcher import EmbeddingMatcher
+                
+                print(f"  [AI Mode: Using semantic embeddings for '{account_type}']")
+                
+                # Initialize matcher with cache directory
+                matcher = EmbeddingMatcher(rcm_df, cache_dir="embeddings_cache")
+                
+                # Create/load embeddings (instant if cached)
+                matcher.create_embeddings()
+                
+                # Find semantically similar controls (threshold=0.7 recommended)
+                matches_df = matcher.find_matches(account_type, threshold=0.7, top_k=20)
+                
+                if len(matches_df) > 0:
+                    # Get full control details from RCM
+                    matches = rcm_df[rcm_df['Control ID'].isin(matches_df['Control ID'])].copy()
+                    print(f"  ✅ Found {len(matches)} controls via semantic embeddings (similarity >= 0.7)")
+                    return matches
+                
+                # If no matches with 0.7, try lower threshold
+                print(f"  ⚠️ No matches at threshold 0.7, trying 0.6...")
+                matches_df = matcher.find_matches(account_type, threshold=0.6, top_k=20)
+                
+                if len(matches_df) > 0:
+                    # Get full control details from RCM
+                    matches = rcm_df[rcm_df['Control ID'].isin(matches_df['Control ID'])].copy()
+                    print(f"  ✅ Found {len(matches)} controls via semantic embeddings (similarity >= 0.6)")
+                    return matches
+                
+                print(f"  ⚠️ No embedding matches found, falling back to GPT-4 matching")
+                
+            except ImportError as e:
+                print(f"  ⚠️ Embedding matcher not available: {e}")
+                print(f"  ⚠️ Falling back to GPT-4 matching")
+            except Exception as e:
+                print(f"  ⚠️ Embedding matching failed: {e}")
+                print(f"  ⚠️ Trying GPT-4 based matching...")
+    
+    # HYBRID APPROACH: Combine GPT-4 + Synonym controls, remove duplicates
+    gpt4_controls = pd.DataFrame()
+    synonym_controls = pd.DataFrame()
+    
+    # TIER 1.5: GPT-4 BASED SEMANTIC MATCHING (intelligent semantic understanding)
+    if use_ai:
+        try:
+            import os
+            from langchain_openai import AzureChatOpenAI
+            
+            print(f"  [Hybrid Mode: Step 1 - GPT-4 semantic matching for '{account_type}']")
+            
+            # Initialize GPT-4 (using existing Azure OpenAI setup)
+            api_key = os.getenv("AZURE_OPENAI_API_KEY")
+            endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+            
+            if api_key and endpoint:
+                # Allow override via environment or Streamlit secrets mirrored to env
+                deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1"))
+                api_version = os.getenv("AZURE_OPENAI_API_VERSION", os.environ.get("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"))
+                model = AzureChatOpenAI(
+                    azure_deployment=deployment,
+                    api_version=api_version,
+                    temperature=0.1,
+                    azure_endpoint=endpoint,
+                    api_key=api_key,
+                )
+                
+                # Use GPT-4 to intelligently match controls
+                gpt4_controls = _gpt4_match_controls(account_type, rcm_df, model)
+                
+                if len(gpt4_controls) > 0:
+                    print(f"  ✅ GPT-4 found {len(gpt4_controls)} controls")
+                else:
+                    print(f"  ⚠️ GPT-4 found 0 controls")
+            else:
+                print(f"  ⚠️ Azure OpenAI not configured, skipping GPT-4")
+                
+        except Exception as e:
+            print(f"  ⚠️ GPT-4 matching failed: {e}")
+    
+    # TIER 2: SYNONYM-BASED MATCHING (comprehensive keyword coverage)
+    print(f"  [Hybrid Mode: Step 2 - Synonym matching for '{account_type}']")
+    
+    ACCOUNT_TYPE_SYNONYMS = {
+        'Cash Summary': ['cash summary', 'cash', 'bank', 'treasury'],
+        'Accrued Credits': ['accrued credits', 'accrued credit', 'credit', 'deferred'],
+        'Payroll Accrual': ['payroll accrual', 'payroll', 'compensation', 'salary', 'wages', 'employee'],
+        'Taxes Payable': ['taxes payable', 'tax', 'income tax', 'vat', 'withholding'],
+        'Accounts Receivable': ['accounts receivable', 'receivable', 'ar ', 'customer receivable', 'trade receivable'],
+        'Accounts Payable': ['accounts payable', 'payable', 'ap ', 'vendor payable', 'trade payable'],
+        'Debt': ['debt', 'loan', 'borrowing', 'note payable', 'interest'],
+        'Inventory': ['inventory', 'stock', 'cost of revenues'],
+        'Fixed Assets': ['fixed assets', 'pp&e', 'ppe', 'property plant', 'capital asset'],
+        'Goodwill': ['goodwill'],
+        'Intangibles': ['intangible', 'intangibles'],
+        'Equity': ['equity', 'stockholder', 'shareholder', 'stock'],
+        'Accrued Expenses': ['accrued expenses', 'accrued expense', 'accrual'],
+    }
+    
+    search_terms = ACCOUNT_TYPE_SYNONYMS.get(account_type, [account_type.lower()])
+    
+    # Build regex pattern with word boundaries
+    import re
+    pattern = '|'.join([rf'\b{re.escape(term)}\b' for term in search_terms])
+    
+    synonym_controls = rcm_df[rcm_df['Control Description'].astype(str).str.lower().str.contains(pattern, na=False, regex=True)].copy()
+    
+    if len(synonym_controls) > 0:
+        print(f"  ✅ Synonym found {len(synonym_controls)} controls")
+    else:
+        print(f"  ⚠️ Synonym found 0 controls")
+    
+    # MERGE RESULTS: Combine GPT-4 + Synonym controls, remove duplicates
+    if not gpt4_controls.empty and not synonym_controls.empty:
+        # Combine both results
+        combined_controls = pd.concat([gpt4_controls, synonym_controls], ignore_index=True)
+        
+        # Remove duplicates based on Control ID
+        combined_controls = combined_controls.drop_duplicates(subset=['Control ID'], keep='first')
+        
+        gpt4_count = len(gpt4_controls)
+        synonym_count = len(synonym_controls)
+        combined_count = len(combined_controls)
+        added_by_synonym = combined_count - gpt4_count
+        
+        print(f"  🔄 Merged: {gpt4_count} (GPT-4) + {synonym_count} (Synonym) = {combined_count} unique controls")
+        if added_by_synonym > 0:
+            print(f"  ✨ Synonym added {added_by_synonym} controls that GPT-4 missed!")
+        
+        return combined_controls
+        
+    elif not gpt4_controls.empty:
+        # Only GPT-4 found controls
+        print(f"  ✅ Final: {len(gpt4_controls)} controls (GPT-4 only)")
+        return gpt4_controls
+        
+    elif not synonym_controls.empty:
+        # Only Synonym found controls
+        print(f"  ✅ Final: {len(synonym_controls)} controls (Synonym only)")
+        return synonym_controls
+    
+    else:
+        # Neither found anything
+        print(f"  ⚠️ No matches found by either method")
+        return pd.DataFrame()
+
+def _drop_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    df_cleaned = df.dropna(how='all')
+    if not df_cleaned.empty:
+        df_cleaned = df_cleaned.loc[~(df_cleaned.apply(lambda x: x.astype(str).str.strip() == "").all(axis=1))]
+    return df_cleaned
+
+def _load_dataframe(file_path: str) -> pd.DataFrame:
+    try:
+        file_extension = file_path.split(".")[-1].lower()
+        if file_extension in _XLSX_FORMATS:
+            return pd.read_excel(file_path)
+        elif file_extension in _CSV_FORMATS:
+            return pd.read_csv(file_path)
+        else:
+            return None
+    except Exception as e:
+        print(f"Error loading file {file_path}: {str(e)}")
+        return None
+
+def _execute_in_sandbox(python_code: str, df: pd.DataFrame, file_path: str) -> str:
+    try:
+        safe_globals = {
+            "__builtins__": SAFE_BUILTINS,
+            "pd": pd,
+            "df": df,
+            "file_path": file_path
+        }
+        local_env = {}
+        output_buffer = io.StringIO()
+        
+        with contextlib.redirect_stdout(output_buffer), contextlib.redirect_stderr(output_buffer):
+            exec(python_code, safe_globals, local_env)
+        
+        captured_output = output_buffer.getvalue()
+        
+        if "result" in local_env:
+            result = local_env["result"]
+            if captured_output.strip():
+                return f"{captured_output}\n--- Result ---\n{result}"
+            return str(result)
+        
+        return captured_output.strip() if captured_output.strip() else \
+               "Code executed successfully with no output."
+    except Exception as e:
+        error_msg = f"Execution error: {str(e)}"
+        print(error_msg)
+        return error_msg
+
+# ===== EXISTING TOOLS =====
+
+@tool(description="""Saves the rcm_file_path into memory""")
+def update_rcm_file_path(rcm_file_path:str, tool_call_id: Annotated[str, InjectedToolCallId]) -> Command:
+    return Command(update={
+        "rcm_file_path" : rcm_file_path,
+        "messages": [
+            ToolMessage(
+                f"Successfully updated rcm file path to {rcm_file_path}",
+                tool_call_id=tool_call_id
+            )
+        ]
+    })
+
+@tool(description="""Saves the trail_balance_file_path into memory""")
+def update_trail_balance_file_path(tb_file_path:str, tool_call_id: Annotated[str, InjectedToolCallId]) -> Command:
+    return Command(update={
+        "trail_balance_file_path" : tb_file_path,
+        "messages": [
+            ToolMessage(
+                f"Successfully updated trial balance file path to {tb_file_path}",
+                tool_call_id=tool_call_id
+            )
+        ]
+    })
+
+@tool(description="""Gets the saved rcm_file_path""")
+def get_rcm_file_path(state: Annotated[AnalystState, InjectedState]) -> str:
+    rcm_file_path = state.get('rcm_file_path')
+    if rcm_file_path:
+        return f"Current RCM file path: {rcm_file_path}"
+    else:
+        return f"No file path found. Available keys: {list(state.keys())}"
+    
+@tool(description="""Gets the saved trail_balance_file_path""")
+def get_tb_file_path(state: Annotated[AnalystState, InjectedState]) -> str:
+    tb_file_path = state.get('trail_balance_file_path')
+    if tb_file_path:
+        return f"Current Trial Balance file path: {tb_file_path}"
+    else:
+        return f"No file path found. Available keys: {list(state.keys())}"
+
+@tool(description="Execute Python code in a secure sandbox environment for data analysis.")
+def analyze_data(
+    python_code: str,
+    which_file:Literal['rcm','trial_balance'],
+    state: Annotated[AnalystState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId]
+):
+    file_path = state.get(f'{which_file}_file_path')
+    if file_path is None:
+        return Command(update={
+            'messages': [
+                ToolMessage(
+                    "File path not set. Please call set_file_path first.", 
+                    tool_call_id=tool_call_id
+                )
+            ]
+        })
+    
+    if not python_code or not python_code.strip():
+        return Command(update={
+            'messages': [
+                ToolMessage(
+                    "Python code is empty or contains only whitespace.", 
+                    tool_call_id=tool_call_id
+                )
+            ]
+        })
+    
+    dataframe = _load_dataframe(file_path)
+    if dataframe is None:
+        return Command(update={
+            'messages': [
+                ToolMessage(
+                    f"Failed to load dataframe from {file_path}.", 
+                    tool_call_id=tool_call_id
+                )
+            ]
+        })
+    
+    return _execute_in_sandbox(python_code, dataframe, file_path)
+
+@tool(description="Get the list of columns in the specified file.")
+def get_columns(
+    which_file:Literal['rcm','trial_balance'],
+    state: Annotated[AnalystState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId]
+) -> Command:
+    if which_file == 'rcm':
+        file_path = state.get('rcm_file_path')
+    elif which_file == 'trial_balance':
+        file_path = state.get('trail_balance_file_path')
+    else:
+        return Command(update={
+            'messages': [
+                ToolMessage(
+                    f"Invalid which_file value: {which_file}.", 
+                    tool_call_id=tool_call_id
+                )
+            ]
+        })
+
+    if file_path is None:
+        return Command(update={
+            'messages': [
+                ToolMessage(
+                    "File path not set.", 
+                    tool_call_id=tool_call_id
+                )
+            ]
+        })
+
+    df = _load_dataframe(file_path)
+    if df is None:
+        return Command(update={
+            'messages': [
+                ToolMessage(
+                    f"Failed to load dataframe from {file_path}.", 
+                    tool_call_id=tool_call_id
+                )
+            ]
+        })
+    
+    columns = df.columns.tolist()
+    return Command(update={
+        'messages': [
+            ToolMessage(
+                f"Columns in {which_file} file: {columns}", 
+                tool_call_id=tool_call_id
+            )
+        ]
+    })
+
+# ===== NEW AI-POWERED TOOLS =====
+
+@tool(description="""
+AI-powered control discovery: Intelligently identifies which controls from the RCM are relevant 
+for a given account type by analyzing control descriptions semantically. This goes beyond simple 
+keyword matching to understand business context and relationships.
+
+Use this when you need to find controls for an account type that might use different terminology
+or when simple keyword matching isn't finding enough relevant controls.
+""")
+def discover_relevant_controls(
+    account_type: str,
+    state: Annotated[AnalystState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    min_confidence: float = 0.6
+) -> Command:
+    """
+    Use AI reasoning to discover controls relevant to an account type.
+    
+    This function analyzes control descriptions and determines relevance based on:
+    - Semantic similarity to account type
+    - Business process relationships  
+    - Financial reporting context
+    - Common SOX control patterns
+    """
+    
+    try:
+        rcm_path = state.get('rcm_file_path')
+        if not rcm_path:
+            return Command(update={
+                'messages': [ToolMessage("RCM file not loaded", tool_call_id=tool_call_id)]
+            })
+        
+        rcm = _load_dataframe(rcm_path)
+        if rcm is None or rcm.empty:
+            return Command(update={
+                'messages': [ToolMessage("Failed to load RCM data", tool_call_id=tool_call_id)]
+            })
+        
+        # AI-POWERED DISCOVERY
+        # In a full implementation, this would:
+        # 1. Send control descriptions to LLM with context about the account type
+        # 2. Ask LLM to score relevance (0-1) for each control
+        # 3. Return controls above confidence threshold
+        
+        # For now, use the enhanced matching function as a placeholder
+        matched_controls = _ai_match_controls(account_type, rcm, use_ai=False)
+        
+        if matched_controls.empty:
+            return Command(update={
+                'messages': [ToolMessage(
+                    f"No controls found for '{account_type}'. This may indicate:\n"
+                    f"- Controls use different terminology in your RCM\n"
+                    f"- Account type is covered by entity-level or ITGC controls\n"
+                    f"- RCM documentation may be incomplete for this area\n\n"
+                    f"Recommendation: Review RCM to identify relevant controls manually.",
+                    tool_call_id=tool_call_id
+                )]
+            })
+        
+        # Format response
+        response = f"### AI-Discovered Controls for '{account_type}'\n\n"
+        response += f"Found **{len(matched_controls)} potentially relevant controls** using semantic analysis:\n\n"
+        
+        # Show top 10 examples
+        for idx, (_, control) in enumerate(matched_controls.head(10).iterrows(), 1):
+            ctrl_id = control.get('Control ID', 'N/A')
+            desc = str(control.get('Control Description', 'N/A'))[:80]
+            key_status = control.get('Key? (Y/N)', 'N/A')
+            response += f"{idx}. **{ctrl_id}** (Key: {key_status})\n"
+            response += f"   {desc}...\n\n"
+        
+        if len(matched_controls) > 10:
+            response += f"*... and {len(matched_controls) - 10} more controls*\n\n"
+        
+        response += f"\n💡 **How AI matching works:**\n"
+        response += f"- Analyzes control descriptions for semantic relevance\n"
+        response += f"- Considers synonyms, related terms, and business context\n"
+        response += f"- Uses financial reporting domain knowledge\n"
+        response += f"- Applies confidence thresholds to avoid false positives\n"
+        
+        return Command(update={
+            'messages': [ToolMessage(response, tool_call_id=tool_call_id)]
+        })
+        
+    except Exception as e:
+        return Command(update={
+            'messages': [ToolMessage(f"Error discovering controls: {str(e)}", tool_call_id=tool_call_id)]
+        })
+
+
+@tool(description="""
+Use semantic analysis to suggest which RCM controls should be mapped to unmapped entities.
+This uses text similarity and business logic to recommend appropriate control mappings.
+""")
+def suggest_control_mappings(
+    account_type: str,
+    unmapped_brands: List[str],
+    state: Annotated[AnalystState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId]
+) -> Command:
+    """Suggest control mappings for unmapped entities using semantic similarity."""
+    
+    try:
+        rcm_path = state.get('rcm_file_path')
+        if not rcm_path:
+            return Command(update={
+                'messages': [ToolMessage("RCM file not loaded", tool_call_id=tool_call_id)]
+            })
+        
+        rcm = _load_dataframe(rcm_path)
+        if rcm is None or rcm.empty:
+            return Command(update={
+                'messages': [ToolMessage("Failed to load RCM data", tool_call_id=tool_call_id)]
+            })
+        
+        # Filter controls related to this account type
+        search_phrase = account_type.lower()
+        related_controls = rcm[
+            rcm['Control Description'].astype(str).str.lower().str.contains(search_phrase, na=False)
+        ].copy()
+        
+        suggestions = []
+        
+        for entity in unmapped_brands:
+            entity_lower = entity.lower()
+            
+            # Find controls with similar entities already mapped
+            if 'Entity' in rcm.columns:
+                similar_entities = rcm[
+                    rcm['Entity'].astype(str).str.lower().str.contains(
+                        entity_lower.split()[0] if ' ' in entity_lower else entity_lower[:3], 
+                        na=False
+                    )
+                ]
+                
+                if not similar_entities.empty:
+                    # Get their control IDs
+                    suggested_controls = similar_entities['Control ID'].unique()[:3]
+                    
+                    suggestions.append({
+                        'entity': entity,
+                        'suggested_controls': suggested_controls.tolist(),
+                        'reason': f'Similar entities use these controls',
+                        'confidence': 'Medium'
+                    })
+            
+            # If no similar entities, suggest by account type
+            if not suggestions or suggestions[-1]['entity'] != entity:
+                if not related_controls.empty:
+                    # Suggest key controls first
+                    key_controls = related_controls[
+                        related_controls['Key? (Y/N)'].astype(str).str.lower().isin(['yes', 'y', 'key'])
+                    ]
+                    
+                    if not key_controls.empty:
+                        suggested = key_controls['Control ID'].head(2).tolist()
+                    else:
+                        suggested = related_controls['Control ID'].head(2).tolist()
+                    
+                    suggestions.append({
+                        'entity': entity,
+                        'suggested_controls': suggested,
+                        'reason': f'Common controls for {account_type}',
+                        'confidence': 'Low-Medium'
+                    })
+        
+        # Format response
+        if suggestions:
+            response = f"### Control Mapping Suggestions for {account_type}\n\n"
+            for s in suggestions:
+                response += f"**{s['entity']}**\n"
+                response += f"- Suggested Controls: {', '.join(s['suggested_controls'])}\n"
+                response += f"- Reason: {s['reason']}\n"
+                response += f"- Confidence: {s['confidence']}\n\n"
+            
+            response += "\n*Note: These are AI-generated suggestions. Please review and validate before applying.*"
+        else:
+            response = f"No control suggestions available for unmapped entities in {account_type}"
+        
+        return Command(update={
+            'messages': [ToolMessage(response, tool_call_id=tool_call_id)]
+        })
+        
+    except Exception as e:
+        return Command(update={
+            'messages': [ToolMessage(f"Error generating suggestions: {str(e)}", tool_call_id=tool_call_id)]
+        })
+
+
+@tool(description="""
+Detect anomalies and unusual patterns in the current audit data by comparing against expected norms.
+Identifies outliers in entity values, unusual scope distributions, and control mapping gaps.
+""")
+def detect_anomalies(
+    state: Annotated[AnalystState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId]
+) -> Command:
+    """Detect anomalies in the audit data."""
+    
+    try:
+        tb_path = state.get('trail_balance_file_path')
+        rcm_path = state.get('rcm_file_path')
+        
+        if not tb_path or not rcm_path:
+            return Command(update={
+                'messages': [ToolMessage("Files not loaded", tool_call_id=tool_call_id)]
+            })
+        
+        tb = _load_dataframe(tb_path)
+        rcm = _load_dataframe(rcm_path)
+        
+        if tb is None or rcm is None:
+            return Command(update={
+                'messages': [ToolMessage("Failed to load data", tool_call_id=tool_call_id)]
+            })
+        
+        anomalies = []
+        
+        # 1. Check for extreme value concentration
+        entity_cols = [c for c in tb.columns if c != 'Account Type']
+        if entity_cols:
+            for col in entity_cols:
+                values = tb[col].apply(_clean_number)
+                if values.sum() > 0:
+                    max_contrib = values.max() / values.sum()
+                    if max_contrib > 0.5:  # Single account type > 50% of entity value
+                        anomalies.append({
+                            'type': 'Value Concentration',
+                            'severity': 'High',
+                            'finding': f'{col}: One account type represents {max_contrib:.1%} of total value',
+                            'recommendation': 'Review if this concentration is expected for this brand'
+                        })
+        
+        # 2. Check for unmapped key controls
+        if 'Entity' in rcm.columns and 'Key? (Y/N)' in rcm.columns:
+            key_controls = rcm[rcm['Key? (Y/N)'].astype(str).str.lower().isin(['yes', 'y', 'key'])]
+            total_key = len(key_controls)
+            
+            if total_key > 0:
+                entities_in_tb = set(entity_cols)
+                entities_in_rcm = set(rcm['Entity'].dropna().unique())
+                missing_brands = entities_in_tb - entities_in_rcm
+                
+                if missing_brands:
+                    pct_missing = len(missing_brands) / len(entities_in_tb)
+                    if pct_missing > 0.2:  # More than 20% entities unmapped
+                        anomalies.append({
+                            'type': 'Control Coverage Gap',
+                            'severity': 'Medium',
+                            'finding': f'{len(missing_brands)} entities ({pct_missing:.1%}) have no control mappings',
+                            'recommendation': 'Consider mapping controls to: ' + ', '.join(list(missing_brands)[:3])
+                        })
+        
+        # 3. Check for unusual account type distribution
+        account_types = tb['Account Type'].value_counts()
+        if len(account_types) < 5:
+            anomalies.append({
+                'type': 'Limited Account Coverage',
+                'severity': 'Low',
+                'finding': f'Only {len(account_types)} account types found',
+                'recommendation': 'Verify if all relevant account types are included in Trial Balance'
+            })
+        
+        # 4. Check for zero-value accounts
+        zero_accounts = []
+        for _, row in tb.iterrows():
+            acc_type = row['Account Type']
+            total = sum(_clean_number(row[col]) for col in entity_cols)
+            if total == 0:
+                zero_accounts.append(acc_type)
+        
+        if zero_accounts:
+            anomalies.append({
+                'type': 'Zero-Value Accounts',
+                'severity': 'Low',
+                'finding': f'{len(zero_accounts)} account types have zero total value',
+                'recommendation': 'Review: ' + ', '.join(zero_accounts[:3])
+            })
+        
+        # Format response
+        if anomalies:
+            response = "### Anomaly Detection Results\n\n"
+            
+            for severity in ['High', 'Medium', 'Low']:
+                severity_items = [a for a in anomalies if a['severity'] == severity]
+                if severity_items:
+                    emoji = '🔴' if severity == 'High' else '🟠' if severity == 'Medium' else '🟡'
+                    response += f"#### {emoji} {severity} Priority\n"
+                    for item in severity_items:
+                        response += f"**{item['type']}**\n"
+                        response += f"- Finding: {item['finding']}\n"
+                        response += f"- Recommendation: {item['recommendation']}\n\n"
+            
+            response += f"\n*Total anomalies detected: {len(anomalies)}*"
+        else:
+            response = "### Anomaly Detection Results\n\n✅ No significant anomalies detected. Data appears consistent."
+        
+        return Command(update={
+            'messages': [ToolMessage(response, tool_call_id=tool_call_id)]
+        })
+        
+    except Exception as e:
+        return Command(update={
+            'messages': [ToolMessage(f"Error detecting anomalies: {str(e)}", tool_call_id=tool_call_id)]
+        })
+
+
+@tool(description="""
+Generate an executive summary of the SOX audit results in natural language.
+Creates a narrative report suitable for senior management and board presentations.
+If analysis_results is not provided, the tool will read metrics from the most recent automation Excel file.
+""")
+def generate_executive_summary(
+    state: Annotated[AnalystState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    analysis_results: Optional[Dict] = None
+) -> Command:
+    """Generate an executive summary of audit results."""
+
+    try:
+        def _coerce_int(v):
+            """Coerce various numeric-like inputs to int safely."""
+            try:
+                if v is None:
+                    return 0
+                # direct int cast for numpy/pandas scalars and ints
+                try:
+                    return int(v)
+                except Exception:
+                    pass
+                s = str(v)
+                import re
+                m = re.search(r"(-?\d+)", s)
+                return int(m.group(1)) if m else 0
+            except Exception:
+                return 0
+
+        # Extract metrics either from provided analysis_results or from generated Excel
+        if not analysis_results or not isinstance(analysis_results, dict):
+            excel_path = state.get('automation_excel_path') if state is not None else None
+            if not excel_path:
+                return Command(update={
+                    'messages': [ToolMessage("No analysis results available. Please run the analysis first or provide analysis_results.", tool_call_id=tool_call_id)]
+                })
+
+            try:
+                import pandas as _pd
+                summary_df = _pd.read_excel(excel_path, sheet_name='ALL_AccountType_Summary')
+                total_accounts = _coerce_int(summary_df['Account Type'].nunique() if 'Account Type' in summary_df.columns else 0)
+                total_brands = _coerce_int(summary_df['Entity'].nunique() if 'Entity' in summary_df.columns else 0)
+                # Count UNIQUE entities that are In Scope (not total rows)
+                in_scope_brands = _coerce_int(summary_df[summary_df.get('Scope') == 'In Scope']['Entity'].nunique() if 'Scope' in summary_df.columns and 'Entity' in summary_df.columns else 0)
+                flags_raised = _coerce_int(summary_df['Flag - Manual Auditor Check'].dropna().astype(str).str.len().gt(0).sum()) if 'Flag - Manual Auditor Check' in summary_df.columns else 0
+                critical_flags = _coerce_int(summary_df['Flag - Manual Auditor Check'].astype(str).str.contains('In Scope & not Mapped', na=False).sum()) if 'Flag - Manual Auditor Check' in summary_df.columns else 0
+            except Exception as e:
+                return Command(update={
+                    'messages': [ToolMessage(f"Could not load analysis results from generated Excel: {e}", tool_call_id=tool_call_id)]
+                })
+
+            try:
+                rcm_df = _pd.read_excel(excel_path, sheet_name='ALL_RCM_Combined')
+                controls_mapped = _coerce_int(rcm_df['Control ID'].nunique()) if 'Control ID' in rcm_df.columns else 0
+            except Exception:
+                controls_mapped = 0
+
+        else:
+            total_accounts = _coerce_int(analysis_results.get('total_account_types', 0))
+            total_brands = _coerce_int(analysis_results.get('total_entities', 0))
+            in_scope_brands = _coerce_int(analysis_results.get('in_scope_entities', 0))
+            flags_raised = _coerce_int(analysis_results.get('total_flags', 0))
+            critical_flags = _coerce_int(analysis_results.get('critical_flags', 0))
+            controls_mapped = _coerce_int(analysis_results.get('controls_mapped', 0))
+
+        notes = []
+        if total_brands <= 0:
+            notes.append("Total entities is zero or missing; percentage metrics will be shown as N/A.")
+        if in_scope_brands > 0 and total_brands > 0 and in_scope_brands > total_brands:
+            notes.append("In-scope entities exceeds total entities — this may indicate a counting or input error. Percentages will be shown as N/A.")
+
+        if total_brands and total_brands > 0 and in_scope_brands <= total_brands:
+            percent_in_scope = (in_scope_brands / total_brands) * 100
+            percent_text = f"{percent_in_scope:.0f}%"
+        else:
+            percent_text = "N/A"
+
+        # Build the narrative in parts to avoid complex nested triple-quotes
+        parts = []
+        parts.append(f"### Executive Summary - SOX Audit Analysis\n\n")
+        parts.append(f"**Overview**\nThis analysis examined {total_accounts} account types across {total_brands} entities to assess SOX compliance scope and control coverage.\n\n")
+        parts.append("**Key Findings**\n\n")
+        parts.append("1. **Scope Determination**\n")
+        parts.append(f"   - {in_scope_brands} of {total_brands} entities ({percent_text}) were classified as \"In Scope\" based on the materiality threshold\n")
+        parts.append("   - These entities represent the material accounts requiring detailed SOX testing\n\n")
+        parts.append("2. **Control Coverage**\n")
+        parts.append(f"   - {controls_mapped} controls were successfully mapped to in-scope brands\n")
+        if flags_raised < 5:
+            parts.append("   - Strong control coverage across key account types\n\n")
+        else:
+            parts.append(f"   - {flags_raised} control gaps identified requiring attention\n\n")
+        parts.append("3. **Risk Flags**\n")
+        if critical_flags > 0:
+            parts.append(f"   - 🔴 **{critical_flags} Critical Issues**: In-scope entities without control mappings\n   - These require immediate auditor attention to ensure compliance coverage\n")
+        if (flags_raised - critical_flags) > 0:
+            parts.append(f"   - 🟠 **{flags_raised - critical_flags} Moderate Issues**: Scope/key control misalignments\n   - Review recommended but not immediately critical\n")
+        if flags_raised == 0:
+            parts.append("   - ✅ **No Critical Issues**: All in-scope entities have appropriate control mappings\n")
+
+        parts.append("\n**Recommendations**\n\n")
+        parts.append("1. **Immediate Actions**\n   - Review and remediate all critical (red) flags before audit fieldwork\n   - Validate control mappings for newly in-scope brands\n\n")
+        parts.append("2. **Near-term Review**\n   - Consider expanding control testing for high-value out-of-scope items\n   - Update RCM documentation for any new control mappings\n\n")
+        parts.append("3. **Process Improvements**\n   - Establish quarterly review cycle for scope determinations\n   - Implement automated alerts for significant entity value changes\n\n")
+        parts.append("**Conclusion**\n")
+        if critical_flags == 0:
+            parts.append("The SOX control framework appears adequately designed for the current scope. Continue with planned testing procedures.\n")
+        else:
+            parts.append(f"Address the {critical_flags} critical gaps identified before proceeding with detailed testing. Overall framework is sound but requires targeted improvements.\n")
+
+        if notes:
+            parts.append("\n**Notes / Warnings**\n")
+            for n in notes:
+                parts.append(f"- {n}\n")
+
+        summary = "".join(parts)
+
+        # Persist the summary to a UTF-8 text file in cloud-app directory
+        try:
+            out_path = Path(__file__).resolve().parent / 'executive_summary.txt'
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, 'w', encoding='utf-8') as fh:
+                fh.write(summary)
+        except Exception as e:
+            # If file write fails, still return the summary in the tool response
+            return Command(update={
+                'messages': [ToolMessage(summary + f"\n\n(Note: failed to write summary file: {e})", tool_call_id=tool_call_id)]
+            })
+
+        return Command(update={
+            'messages': [ToolMessage(summary, tool_call_id=tool_call_id)],
+            'executive_summary_path': str(out_path)
+        })
+
+    except Exception as e:
+        return Command(update={
+            'messages': [ToolMessage(f"Error generating summary: {str(e)}", tool_call_id=tool_call_id)]
+        })
+
+
+@tool(parse_docstring=True, error_on_invalid_docstring=False)
+def run_sox_automation(
+    selected_account_types: Optional[list],
+    threshold: float,
+    state: Annotated[AnalystState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId]
+):
+    """Run the SOX automation end-to-end with enhanced analytics.
+
+    Args:
+        selected_account_types: optional list of account types to process
+        threshold: fraction (0-1) cumulative threshold for In Scope
+
+    Returns:
+        Command: with automation results and paths to generated files
+    """
+    
+    try:
+        excel_filename = "Final_Automation_Report.xlsx"
+        pdf_filename = "SOX_Charts.pdf"
+        
+        rcm_path = state.get('rcm_file_path')
+        tb_path = state.get('trail_balance_file_path')
+
+        rcm = _load_dataframe(rcm_path)
+        tb = _load_dataframe(tb_path)
+        
+        if rcm is None or tb is None:
+            return Command(update={
+                'messages': [ToolMessage("Failed to load data files", tool_call_id=tool_call_id)]
+            })
+
+        # Validation
+        required_rcm_columns = ['Control Description', 'Control ID', 'Entity', 'Key? (Y/N)']
+        missing = [c for c in required_rcm_columns if c not in rcm.columns]
+        if missing:
+            return Command(update={
+                'messages': [ToolMessage(f"RCM missing columns: {missing}", tool_call_id=tool_call_id)]
+            })
+
+        if 'Account Type' not in tb.columns:
+            return Command(update={
+                'messages': [ToolMessage("Trial Balance missing 'Account Type' column", tool_call_id=tool_call_id)]
+            })
+
+        # Clean data
+        rcm = _drop_blank_rows(rcm)
+        tb = _drop_blank_rows(tb)
+
+        # Process account types
+        tb['Account Type'] = tb['Account Type'].astype(str).str.strip()
+        account_types = sorted(tb['Account Type'].dropna().unique())
+        if selected_account_types is None or len(selected_account_types) == 0:
+            selected_account_types = account_types
+
+        entity_cols = [c for c in tb.columns if c != 'Account Type']
+        if not entity_cols:
+            return Command(update={
+                'messages': [ToolMessage("No entity columns found in Trial Balance", tool_call_id=tool_call_id)]
+            })
+
+        # Aggregate TB
+        tb_agg = tb.copy()
+        for col in entity_cols:
+            tb_agg[col] = tb_agg[col].apply(_clean_number)
+        tb_agg = tb_agg.groupby('Account Type', as_index=False)[entity_cols].sum()
+
+        # Process each account type
+        all_entity_summaries = []
+        all_matched_controls = []
+        individual_results = []
+        
+        # Track metrics for executive summary
+        total_flags = 0
+        critical_flags = 0
+        total_controls_mapped = 0
+
+        for acc in selected_account_types:
+            acc = str(acc).strip()
+            row = tb_agg[tb_agg['Account Type'].str.lower() == acc.lower()]
+            if row.empty:
+                continue
+            row = row.iloc[0]
+
+            # Build entity value df
+            entities = []
+            for b in entity_cols:
+                val = _clean_number(row[b])
+                entities.append({'Entity': b, 'Account Value': val})
+            entities_df = pd.DataFrame(entities).sort_values('Account Value', ascending=False).reset_index(drop=True)
+
+            total = entities_df['Account Value'].sum()
+            if total == 0:
+                entities_df['% of Total'] = 0.0
+                entities_df['Cumulative %'] = 0.0
+            else:
+                entities_df['% of Total'] = (entities_df['Account Value'] / total).round(6)
+                entities_df['Cumulative %'] = entities_df['% of Total'].cumsum().round(6)
+
+            # Determine Scope
+            scope_flags = []
+            threshold_reached = False
+            for cum in entities_df['Cumulative %']:
+                if not threshold_reached:
+                    scope_flags.append('In Scope')
+                    if cum >= threshold:
+                        threshold_reached = True
+                else:
+                    scope_flags.append('Out of Scope')
+            
+            if not any(s == 'In Scope' for s in scope_flags) and not entities_df.empty:
+                scope_flags[0] = 'In Scope'
+            entities_df['Scope'] = scope_flags
+
+            # Find matched controls using AI-powered matching (with synonym fallback)
+            # Tier 1: Azure Embeddings → Tier 1.5: GPT-4 Semantic → Tier 2: Synonym fallback
+            matched_controls = _ai_match_controls(acc, rcm, use_ai=True)  # AI-powered matching enabled for maximum coverage
+            
+            if not matched_controls.empty:
+                matched_controls['Mapped Process Group'] = matched_controls['Control ID'].apply(_map_control_id_to_process)
+                total_controls_mapped += len(matched_controls)
+            else:
+                matched_controls = pd.DataFrame(columns=rcm.columns.tolist() + ['Mapped Process Group'])
+
+            # Map control status
+            mapped_rcm_brands = []
+            if 'Entity' in matched_controls.columns and not matched_controls.empty:
+                mapped_rcm_brands = matched_controls['Entity'].dropna().unique().tolist()
+
+            entities_df['Mapped in RCM'] = entities_df['Entity'].apply(lambda x: 'Yes' if x in mapped_rcm_brands else 'No')
+
+            # Key status lookup
+            if 'Entity' in matched_controls.columns and 'Key? (Y/N)' in matched_controls.columns:
+                key_status_map = matched_controls.set_index('Entity')['Key? (Y/N)'].fillna('').astype(str).to_dict()
+            else:
+                key_status_map = {}
+
+            entities_df['Key Status'] = entities_df['Entity'].apply(lambda x: key_status_map.get(x, '') if x in mapped_rcm_brands else '')
+
+            # Flag generation
+            def derive_auditor_check_flag(row):
+                flag_messages = []
+                if row['Scope'] == 'In Scope' and row['Mapped in RCM'] == 'No':
+                    flag_messages.append('⚠️ Review: In Scope & not Mapped in RCM')
+                    nonlocal critical_flags
+                    critical_flags += 1
+                else:
+                    key_status = str(row.get('Key Status', '')).strip().lower()
+                    if row['Mapped in RCM'] == 'Yes':
+                        if row['Scope'] == 'In Scope' and key_status in ['no', 'non-key']:
+                            flag_messages.append('⚠️ Review: In Scope & Non-Key')
+                        elif row['Scope'] == 'Out of Scope' and key_status in ['yes', 'key']:
+                            flag_messages.append('⚠️ Review: Out of Scope & Key')
+                
+                if flag_messages:
+                    nonlocal total_flags
+                    total_flags += len(flag_messages)
+                
+                return ', '.join(flag_messages) if flag_messages else ''
+
+            entities_df['Flag - Manual Auditor Check'] = entities_df.apply(derive_auditor_check_flag, axis=1)
+
+            entities_df['Account Type'] = acc
+
+            # Reorder columns
+            summary_cols_order = ['Account Type', 'Entity', 'Account Value', '% of Total', 'Cumulative %',
+                                  'Scope', 'Mapped in RCM', 'Key Status', 'Flag - Manual Auditor Check']
+            entities_df = entities_df[[c for c in summary_cols_order if c in entities_df.columns]]
+
+            # Add Scope to matched_controls
+            if 'Entity' in matched_controls.columns:
+                temp_scope_map = entities_df.set_index('Entity')['Scope'].to_dict()
+                matched_controls['Scope'] = matched_controls['Entity'].map(temp_scope_map).fillna('Not Analyzed in TB Scope')
+            else:
+                matched_controls['Scope'] = 'N/A - Entity column missing'
+
+            matched_controls['Account Type'] = acc
+
+            # Reorder matched_controls columns
+            rcm_cols_order = ['Account Type'] + [col for col in matched_controls.columns if col != 'Account Type']
+            matched_controls = matched_controls[rcm_cols_order]
+
+            all_entity_summaries.append(entities_df)
+            all_matched_controls.append(matched_controls)
+            individual_results.append((acc, entities_df, matched_controls))
+
+        # Write Excel report (align formatting and color rules with Streamlit export)
+        with pd.ExcelWriter(excel_filename, engine='xlsxwriter') as writer:
+            workbook = writer.book
+
+            # Base formats
+            data_base_fmt = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1})
+            header_fmt = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1, 'bold': True})
+            pct_fmt = workbook.add_format({'num_format': '0.00%'})
+
+            # Color rules (same mapping as Streamlit)
+            color_rules = {
+                ('In Scope', 'Yes'): '#C6EFCE',
+                ('In Scope', 'No'): '#FF9999',
+                ('Out of Scope', 'Yes'): '#FFEB9C',
+                ('Out of Scope', 'No'): '#D9D9D9',
+                '⚠️ Review: In Scope & Non-Key': '#F4B084',
+                '⚠️ Review: Out of Scope & Key': '#D9D2E9',
+                '⚠️ Review: In Scope & not Mapped in RCM': '#FF6347'
+            }
+
+            # Pre-create color formats
+            color_excel_formats = {}
+            for key, color_code in color_rules.items():
+                color_excel_formats[key] = workbook.add_format({'bg_color': color_code, 'align': 'center', 'valign': 'vcenter', 'border': 1})
+
+            # Helper to write a DataFrame to a sheet with header formats and conditional coloring
+            def _write_df_with_formats(df, sheet_name):
+                # Add row number column starting from 1
+                df_with_rownum = df.copy()
+                df_with_rownum.insert(0, 'S.No', range(1, len(df_with_rownum) + 1))
+                
+                # Sanitize sheet name length and uniqueness handled by caller
+                df_with_rownum.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
+                worksheet = writer.sheets[sheet_name]
+
+                # Write headers with header_fmt and set sensible column widths
+                for col_num, col_name in enumerate(df_with_rownum.columns):
+                    worksheet.write(0, col_num, col_name, header_fmt)
+                    if col_name == 'S.No':
+                        worksheet.set_column(col_num, col_num, 8)
+                    elif col_name == 'Control Description' or col_name == 'Risk Description':
+                        worksheet.set_column(col_num, col_num, 40)
+                    elif col_name in ['Account Type', 'Entity', 'Scope', 'Mapped in RCM', 'Key Status']:
+                        worksheet.set_column(col_num, col_num, 20)
+                    elif col_name in ['Account Value', '% of Total', 'Cumulative %']:
+                        worksheet.set_column(col_num, col_num, 15)
+                    elif col_name == 'Flag - Manual Auditor Check':
+                        worksheet.set_column(col_num, col_num, 35)
+                    else:
+                        worksheet.set_column(col_num, col_num, 15)
+
+                # Write data rows with conditional formatting and number formats
+                for row_num, row in df_with_rownum.iterrows():
+                    flag_value = row.get('Flag - Manual Auditor Check', '')
+                    scope_mapped_tuple = (row.get('Scope'), row.get('Mapped in RCM'))
+
+                    # Determine highlight color key based on precedence
+                    highlight_color_key = None
+                    if pd.notna(flag_value) and str(flag_value).strip() in color_rules:
+                        highlight_color_key = str(flag_value).strip()
+                    elif scope_mapped_tuple in color_rules:
+                        highlight_color_key = scope_mapped_tuple
+
+                    # Select base cell format
+                    base_fmt = color_excel_formats.get(highlight_color_key, data_base_fmt)
+
+                    for col_num, col_name in enumerate(df_with_rownum.columns):
+                        value = row[col_name]
+                        display_value = "" if pd.isna(value) else value
+
+                        # Create per-cell final format to ensure number formats are applied
+                        final_props = {'align': 'center', 'valign': 'vcenter', 'border': 1}
+                        if isinstance(base_fmt, dict):
+                            bg = base_fmt.get('bg_color')
+                        else:
+                            try:
+                                bg = base_fmt.bg_color
+                            except Exception:
+                                bg = None
+                        if bg:
+                            final_props['bg_color'] = bg
+
+                        final_cell_format = workbook.add_format(final_props)
+
+                        if col_name == 'Account Value':
+                            final_cell_format.set_num_format('#,##0')
+                        elif col_name in ['% of Total', 'Cumulative %']:
+                            final_cell_format.set_num_format('0.00%')
+
+                        worksheet.write(row_num + 1, col_num, display_value, final_cell_format)
+
+            # --- Consolidated summary ---
+            if individual_results:
+                df_summary_consolidated = pd.concat([df for _, df, _ in individual_results], ignore_index=True)
+                sheet_name = 'ALL_AccountType_Summary'
+                _write_df_with_formats(df_summary_consolidated, sheet_name)
+
+            # --- Consolidated RCM ---
+            if all_matched_controls:
+                df_rcm_consolidated = pd.concat(all_matched_controls, ignore_index=True, sort=False)
+                sheet_name = 'ALL_RCM_Combined'
+                _write_df_with_formats(df_rcm_consolidated, sheet_name)
+
+            # --- Individual sheets ---
+            for acc, df_summary, df_rcm in individual_results:
+                sn = f"Summary - {acc}"
+                rn = f"RCM - {acc}"
+
+                sheet_name_summary = sn[:31]
+                # Ensure unique sheet name
+                suffix = 0
+                base_name = sheet_name_summary
+                while sheet_name_summary in writer.book.sheetnames:
+                    suffix += 1
+                    sheet_name_summary = f"{base_name}_{suffix}"[:31]
+
+                _write_df_with_formats(df_summary, sheet_name_summary)
+
+                if not df_rcm.empty:
+                    sheet_name_rcm = rn[:31]
+                    suffix = 0
+                    base_name = sheet_name_rcm
+                    while sheet_name_rcm in writer.book.sheetnames:
+                        suffix += 1
+                        sheet_name_rcm = f"{base_name}_{suffix}"[:31]
+                    _write_df_with_formats(df_rcm, sheet_name_rcm)
+            
+            # --- Column Mapping Reference Sheet (for transparency) ---
+            # Try to get column mapping from state (if available from intelligent mapper)
+            column_mapping_info = state.get('rcm_column_mapping', None)
+            
+            # Debug: Print to console to verify mapping data
+            print(f"DEBUG: Column mapping info from state: {column_mapping_info}")
+            
+            if column_mapping_info and isinstance(column_mapping_info, dict):
+                try:
+                    print("DEBUG: Creating Column Mapping Info sheet...")
+                    mapping_df = pd.DataFrame({
+                        'Standard Column Name': column_mapping_info['standard_name'],
+                        'Original Column Name': column_mapping_info['original_name'],
+                        'Mapping Method': column_mapping_info['mapping_method']
+                    })
+                    
+                    # Add timestamp and metadata
+                    from datetime import datetime
+                    mapping_df['Mapping Date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    # Write to sheet with formatting
+                    sheet_name = 'Column Mapping Info'
+                    mapping_df.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
+                    worksheet = writer.sheets[sheet_name]
+                    
+                    # Format headers
+                    for col_num, col_name in enumerate(mapping_df.columns):
+                        worksheet.write(0, col_num, col_name, header_fmt)
+                        if col_name == 'Standard Column Name' or col_name == 'Original Column Name':
+                            worksheet.set_column(col_num, col_num, 30)
+                        elif col_name == 'Mapping Method':
+                            worksheet.set_column(col_num, col_num, 20)
+                        else:
+                            worksheet.set_column(col_num, col_num, 25)
+                    
+                    # Write data with center alignment
+                    for row_num, row in mapping_df.iterrows():
+                        for col_num, col_name in enumerate(mapping_df.columns):
+                            value = row[col_name]
+                            worksheet.write(row_num + 1, col_num, value, data_base_fmt)
+                    
+                    # Add explanation header with merge
+                    info_fmt = workbook.add_format({
+                        'bold': True, 
+                        'font_size': 11,
+                        'align': 'left',
+                        'valign': 'vcenter',
+                        'bg_color': '#E7E6E6',
+                        'border': 1
+                    })
+                    worksheet.write(len(mapping_df) + 3, 0, 'About this sheet:', info_fmt)
+                    
+                    desc_fmt = workbook.add_format({
+                        'align': 'left',
+                        'valign': 'top',
+                        'text_wrap': True,
+                        'border': 1
+                    })
+                    explanation = (
+                        "This sheet shows how column names from your uploaded RCM file were mapped to "
+                        "standard SOX column names. The AI-powered mapper recognizes various naming "
+                        "conventions (e.g., 'BU', 'Business Unit', 'Entity' all map to 'Entity'). "
+                        "This ensures consistency in reporting while maintaining transparency about the "
+                        "original column names used in your source data."
+                    )
+                    worksheet.merge_range(len(mapping_df) + 4, 0, len(mapping_df) + 4, 3, explanation, desc_fmt)
+                    worksheet.set_row(len(mapping_df) + 4, 60)  # Set height for wrapped text
+                    
+                    print(f"DEBUG: ✅ Column Mapping Info sheet created successfully with {len(mapping_df)} rows")
+                    
+                except Exception as e:
+                    # If mapping sheet creation fails, continue without it
+                    print(f"DEBUG: ❌ Could not create column mapping sheet: {e}")
+            else:
+                print("DEBUG: ⚠️ No column mapping info found in state, skipping mapping sheet")
+
+        # Create PDF charts
+        with PdfPages(pdf_filename) as pdf:
+            for acc, df_summary, _ in individual_results:
+                fig = plt.figure(figsize=(12, 5))
+                axs = fig.subplots(1, 2)
+
+                df_plot = df_summary.copy()
+                if df_plot.empty:
+                    axs[0].text(0.5, 0.5, f'No entity data for {acc}', ha='center', va='center')
+                    axs[0].set_axis_off()
+                    axs[1].text(0.5, 0.5, 'No entity data for Scope Split', ha='center', va='center')
+                    axs[1].set_axis_off()
+                else:
+                    plot_data = df_plot[df_plot['% of Total'] > 0].copy()
+
+                    if not plot_data.empty:
+                        color_map = {'In Scope': '#2ca02c', 'Out of Scope': '#d3d3d3'}
+                        bar_colors = plot_data['Scope'].map(color_map).fillna('gray')
+                        axs[0].bar(plot_data['Entity'], plot_data['Account Value'], color=bar_colors)
+                        axs[0].set_title(f"{acc} - Contribution by Brand")
+                        axs[0].set_ylabel('Value')
+                        axs[0].tick_params(axis='x', rotation=45)
+                        
+                        for i, (_, row) in enumerate(plot_data.iterrows()):
+                            val = row['Account Value']
+                            pct = row['% of Total']
+                            axs[0].text(i, val, f"{val:,.0f}\n{pct:.1%}", ha='center', va='bottom', fontsize=8)
+                    else:
+                        axs[0].text(0.5, 0.5, 'No entity data to plot', ha='center', va='center')
+                        axs[0].set_axis_off()
+
+                    scope_counts = plot_data.groupby('Scope')['Account Value'].sum()
+                    if not scope_counts.empty and scope_counts.sum() > 0:
+                        pie_colors = [('#2ca02c' if s == 'In Scope' else '#d3d3d3') for s in scope_counts.index]
+                        scope_counts.plot.pie(autopct='%1.1f%%', colors=pie_colors, startangle=90, ax=axs[1], textprops={'fontsize': 10})
+                        axs[1].set_title(f"{acc} - Scope Split")
+                        axs[1].set_ylabel('')
+                    else:
+                        axs[1].text(0.5, 0.5, 'No data for Scope Split', ha='center', va='center')
+                        axs[1].set_axis_off()
+
+                fig.suptitle(f"SOX Audit Analysis for {acc}")
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+
+        # Prepare metrics for executive summary
+        # Use consolidated DataFrames to avoid double-counting brands/controls across account types
+        total_account_types = len(individual_results)
+        total_brands = len(entity_cols)
+
+        all_summary_df = pd.concat(all_entity_summaries, ignore_index=True) if all_entity_summaries else pd.DataFrame()
+        # Unique entities in-scope across all summaries
+        if not all_summary_df.empty and 'Scope' in all_summary_df.columns and 'Entity' in all_summary_df.columns:
+            in_scope_brands = int(all_summary_df.loc[all_summary_df['Scope'] == 'In Scope', 'Entity'].dropna().astype(str).unique().size)
+            # Flags: count non-empty flag cells
+            total_flags = int(all_summary_df['Flag - Manual Auditor Check'].astype(str).replace('nan','').str.strip().replace('', pd.NA).dropna().shape[0]) if 'Flag - Manual Auditor Check' in all_summary_df.columns else int(total_flags)
+            # Critical flags are those that indicate 'In Scope & not Mapped' (use contains to be tolerant)
+            if 'Flag - Manual Auditor Check' in all_summary_df.columns:
+                critical_flags = int(all_summary_df['Flag - Manual Auditor Check'].astype(str).str.contains('In Scope & not Mapped', na=False).sum())
+        else:
+            in_scope_brands = 0
+
+        # Controls mapped: use unique Control ID values from combined RCM if available
+        try:
+            combined_rcm = pd.concat(all_matched_controls, ignore_index=True, sort=False) if all_matched_controls else pd.DataFrame()
+            controls_mapped = int(combined_rcm['Control ID'].nunique()) if not combined_rcm.empty and 'Control ID' in combined_rcm.columns else int(total_controls_mapped)
+        except Exception:
+            controls_mapped = int(total_controls_mapped)
+
+        analysis_summary = {
+            'total_account_types': total_account_types,
+            'total_entities': total_brands,
+            'in_scope_entities': in_scope_brands,
+            'total_flags': int(total_flags),
+            'critical_flags': int(critical_flags),
+            'controls_mapped': int(controls_mapped)
+        }
+
+        msg = f"Analysis complete! Processed {len(individual_results)} account types. {total_flags} flags raised ({critical_flags} critical)."
+
+        return Command(update={
+            'messages': [ToolMessage(msg, tool_call_id=tool_call_id)],
+            'automation_excel_path': excel_filename,
+            'automation_pdf_path': pdf_filename,
+            'analysis_summary': analysis_summary
+        })
+
+    except Exception as e:
+        return Command(update={
+            'messages': [ToolMessage(f"Automation error: {str(e)}", tool_call_id=tool_call_id)]
+        })

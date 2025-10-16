@@ -1,0 +1,17 @@
+# Local virtual environments
+cloud_ai/
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Streamlit local secrets (do not commit)
+.streamlit/secrets.toml
+
+# Generated artifacts
+*.xlsx
+*.pdf
+executive_summary.txt
+uploaded_*
