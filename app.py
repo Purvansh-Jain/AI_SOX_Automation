@@ -46,6 +46,9 @@ from tools import (
     detect_anomalies,
     generate_executive_summary,
     discover_relevant_controls,
+    get_flag_counts_by_account_type,
+    list_in_scope_entities,
+    qa_results,
 )
 from models import AnalystState
 import pandas as pd
@@ -79,6 +82,7 @@ TOOLS = [
     update_trail_balance_file_path, analyze_data, get_columns,
     run_sox_automation, suggest_control_mappings, detect_anomalies,
     generate_executive_summary, discover_relevant_controls,
+    get_flag_counts_by_account_type, list_in_scope_entities, qa_results,
 ]
 
 config = {"configurable": {"thread_id": "1"}}

@@ -172,7 +172,7 @@ def _ai_match_controls(account_type: str, rcm_df: pd.DataFrame, use_ai: bool = T
         if not skip_embeddings:
             try:
                 # TIER 1: SEMANTIC EMBEDDING-BASED MATCHING (Local or Azure)
-                from embedding_matcher import EmbeddingMatcher
+                from Embeddings.embedding_matcher import EmbeddingMatcher
                 
                 print(f"  [AI Mode: Using semantic embeddings for '{account_type}']")
                 
@@ -809,6 +809,106 @@ def detect_anomalies(
         })
 
 
+@tool(description="Return flag counts by Account Type from the latest automation results Excel. Shows top-N by total and critical flags.")
+def get_flag_counts_by_account_type(
+    state: Annotated[AnalystState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    top_n: int = 10
+) -> Command:
+    """Summarize flags per Account Type using the generated 'ALL_AccountType_Summary' sheet.
+
+    Returns a formatted message plus a machine-friendly list under 'flag_counts_by_account_type'.
+    """
+    try:
+        import os as _os
+        import pandas as _pd
+
+        excel_path = state.get('automation_excel_path') if state is not None else None
+
+        # Fallback discovery if path missing or file moved
+        if not excel_path or not _os.path.exists(excel_path):
+            candidates = [
+                excel_path,
+                "Final_Automation_Report.xlsx",
+                str(Path('cloud-app') / 'Final_Automation_Report.xlsx'),
+                str(Path('ai-app') / 'Final_Automation_Report.xlsx')
+            ]
+            excel_path = next((p for p in candidates if p and _os.path.exists(p)), None)
+
+        if not excel_path:
+            return Command(update={
+                'messages': [ToolMessage(
+                    "No automation results located. Please run the analysis first (Run SOX Automation) so the Excel is generated.",
+                    tool_call_id=tool_call_id
+                )]
+            })
+
+        try:
+            df = _pd.read_excel(excel_path, sheet_name='ALL_AccountType_Summary')
+        except Exception as _e:
+            return Command(update={
+                'messages': [ToolMessage(
+                    f"Could not open results sheet from '{excel_path}': {_e}", tool_call_id=tool_call_id
+                )]
+            })
+
+        if 'Account Type' not in df.columns:
+            return Command(update={
+                'messages': [ToolMessage(
+                    "Results file is missing 'Account Type' column.", tool_call_id=tool_call_id
+                )]
+            })
+
+        flag_col = 'Flag - Manual Auditor Check'
+        if flag_col not in df.columns:
+            return Command(update={
+                'messages': [ToolMessage(
+                    f"Results file is missing '{flag_col}' column.", tool_call_id=tool_call_id
+                )]
+            })
+
+        # Normalize flags and compute per-row indicators
+        flags_series = df[flag_col].astype(str)
+        has_flag = flags_series.str.strip().replace({'nan': '', 'None': ''}).ne('')
+        is_critical = flags_series.str.contains('In Scope & not Mapped', case=False, na=False)
+
+        tmp = _pd.DataFrame({
+            'Account Type': df['Account Type'].astype(str),
+            '_flag': has_flag.astype(int),
+            '_critical': is_critical.astype(int)
+        })
+
+        agg = tmp.groupby('Account Type', as_index=False).agg(
+            total_flags=('_flag', 'sum'),
+            critical_flags=('_critical', 'sum')
+        )
+
+        agg = agg.sort_values(['total_flags', 'critical_flags', 'Account Type'], ascending=[False, False, True])
+        top = agg.head(int(top_n)).reset_index(drop=True)
+
+        # Build readable message
+        lines = ["### Account Types with Most Flags\n"]
+        if top.empty:
+            lines.append("No flags found in the results.")
+        else:
+            for i, row in top.iterrows():
+                lines.append(
+                    f"{i+1}. {row['Account Type']}: {int(row['total_flags'])} flags (Critical: {int(row['critical_flags'])})"
+                )
+
+        msg = "\n".join(lines)
+
+        return Command(update={
+            'messages': [ToolMessage(msg, tool_call_id=tool_call_id)],
+            'automation_excel_path': excel_path,
+            'flag_counts_by_account_type': top.to_dict(orient='records')
+        })
+
+    except Exception as e:
+        return Command(update={
+            'messages': [ToolMessage(f"Error summarizing flag counts: {str(e)}", tool_call_id=tool_call_id)]
+        })
+
 @tool(description="""
 Generate an executive summary of the SOX audit results in natural language.
 Creates a narrative report suitable for senior management and board presentations.
@@ -1429,4 +1529,472 @@ def run_sox_automation(
     except Exception as e:
         return Command(update={
             'messages': [ToolMessage(f"Automation error: {str(e)}", tool_call_id=tool_call_id)]
+        })
+
+
+@tool(description="List in-scope entities (brands) from the generated results Excel. Optional filter by account_type.")
+def list_in_scope_entities(
+    state: Annotated[AnalystState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    account_type: Optional[str] = None,
+    limit: int = 100
+) -> Command:
+    """Return unique entities with Scope == 'In Scope' from ALL_AccountType_Summary.
+
+    Args:
+        account_type: Optional case-insensitive filter for a specific account type
+        limit: Max number of entities to list in the message (full list returned in data)
+    """
+    try:
+        import os as _os
+        import pandas as _pd
+
+        excel_path = state.get('automation_excel_path') if state is not None else None
+        if not excel_path or not _os.path.exists(excel_path):
+            candidates = [
+                excel_path,
+                "Final_Automation_Report.xlsx",
+                str(Path(__file__).resolve().parent / 'Final_Automation_Report.xlsx'),
+                str(Path('ai-app') / 'Final_Automation_Report.xlsx')
+            ]
+            excel_path = next((p for p in candidates if p and _os.path.exists(p)), None)
+
+        if not excel_path:
+            return Command(update={
+                'messages': [ToolMessage(
+                    "No automation results located. Please run the analysis first.",
+                    tool_call_id=tool_call_id
+                )]
+            })
+
+        df = _pd.read_excel(excel_path, sheet_name='ALL_AccountType_Summary')
+        required = {'Entity', 'Scope'}
+        if not required.issubset(df.columns):
+            return Command(update={
+                'messages': [ToolMessage(
+                    "Results file is missing required columns for scope listing.", tool_call_id=tool_call_id
+                )]
+            })
+
+        scoped = df[df['Scope'].astype(str).str.strip().str.lower() == 'in scope']
+        if account_type and 'Account Type' in df.columns:
+            scoped = scoped[scoped['Account Type'].astype(str).str.lower() == str(account_type).lower()]
+
+        entities = (
+            scoped['Entity']
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .unique()
+            .tolist()
+        )
+        entities_sorted = sorted([e for e in entities if e])
+
+        count = len(entities_sorted)
+        head = entities_sorted[: max(0, int(limit))]
+        title = f"In-scope entities{' for ' + account_type if account_type else ''}: {count} found"
+        lines = [title]
+        if head:
+            for i, ent in enumerate(head, 1):
+                lines.append(f"{i}. {ent}")
+            if count > len(head):
+                lines.append(f"... and {count - len(head)} more")
+        else:
+            lines.append("None")
+
+        msg = "\n".join(lines)
+
+        return Command(update={
+            'messages': [ToolMessage(msg, tool_call_id=tool_call_id)],
+            'automation_excel_path': excel_path,
+            'in_scope_entities': entities_sorted,
+            'in_scope_entities_count': count
+        })
+
+    except Exception as e:
+        return Command(update={
+            'messages': [ToolMessage(f"Error listing in-scope entities: {str(e)}", tool_call_id=tool_call_id)]
+        })
+
+
+@tool(description="Ask free-form questions about the generated results (Excel). Returns a concise answer and, when applicable, a compact table.")
+def qa_results(
+    question: str,
+    state: Annotated[AnalystState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    limit: int = 25
+) -> Command:
+    """General Q&A over Final_Automation_Report.xlsx (ALL_AccountType_Summary and ALL_RCM_Combined).
+
+    Uses a constrained JSON plan generated by the LLM (or heuristics fallback) and executes it
+    safely on in-memory DataFrames without arbitrary code execution.
+    """
+    try:
+        import os as _os
+        import pandas as _pd
+        import json as _json
+
+        # 1) Locate results Excel
+        excel_path = state.get('automation_excel_path') if state is not None else None
+        if not excel_path or not _os.path.exists(excel_path):
+            candidates = [
+                excel_path,
+                "Final_Automation_Report.xlsx",
+                str(Path(__file__).resolve().parent / 'Final_Automation_Report.xlsx'),
+                str(Path('ai-app') / 'Final_Automation_Report.xlsx')
+            ]
+            excel_path = next((p for p in candidates if p and _os.path.exists(p)), None)
+
+        if not excel_path:
+            return Command(update={
+                'messages': [ToolMessage(
+                    "No automation results located. Please run the analysis first (Run SOX Automation).",
+                    tool_call_id=tool_call_id
+                )]
+            })
+
+        # 2) Load sheets (lenient)
+        df_summary = None
+        df_rcm = None
+        try:
+            df_summary = _pd.read_excel(excel_path, sheet_name='ALL_AccountType_Summary')
+        except Exception:
+            pass
+        try:
+            df_rcm = _pd.read_excel(excel_path, sheet_name='ALL_RCM_Combined')
+        except Exception:
+            pass
+
+        if df_summary is None and df_rcm is None:
+            return Command(update={
+                'messages': [ToolMessage(
+                    "Could not read the results sheets from the Excel. Ensure 'ALL_AccountType_Summary' exists.",
+                    tool_call_id=tool_call_id
+                )]
+            })
+
+        # 3) Prepare derived columns and schema
+        if df_summary is not None and not df_summary.empty:
+            flag_col = 'Flag - Manual Auditor Check'
+            if flag_col in df_summary.columns:
+                s = df_summary[flag_col].astype(str)
+                df_summary['_flag'] = s.str.strip().replace({'nan': '', 'None': ''}).ne('').astype(int)
+                df_summary['_critical'] = s.str.contains('In Scope & not Mapped', case=False, na=False).astype(int)
+            else:
+                df_summary['_flag'] = 0
+                df_summary['_critical'] = 0
+        else:
+            df_summary = _pd.DataFrame()
+
+        if df_rcm is None:
+            df_rcm = _pd.DataFrame()
+
+        def _norm_series(series):
+            return series.astype(str).str.strip()
+        for col in ['Account Type', 'Entity', 'Scope']:
+            if col in df_summary.columns:
+                df_summary[col] = _norm_series(df_summary[col])
+        for col in ['Account Type','Entity','Scope']:
+            if col in df_rcm.columns:
+                df_rcm[col] = _norm_series(df_rcm[col])
+
+        summary_cols = list(df_summary.columns) if not df_summary.empty else []
+        rcm_cols = list(df_rcm.columns) if not df_rcm.empty else []
+
+        # 4) LLM planner (with fallback)
+        plan = None
+        llm_error = None
+        try:
+            import os as __os
+            from langchain_openai import AzureChatOpenAI as __Azure
+            from langchain_core.messages import HumanMessage as __HM
+
+            api_key = __os.getenv('AZURE_OPENAI_API_KEY')
+            endpoint = __os.getenv('AZURE_OPENAI_ENDPOINT')
+            deployment = __os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt-4.1')
+            api_version = __os.getenv('AZURE_OPENAI_API_VERSION', '2025-01-01-preview')
+
+            if api_key and endpoint:
+                _model = __Azure(
+                    azure_deployment=deployment,
+                    api_version=api_version,
+                    temperature=0.0,
+                    azure_endpoint=endpoint,
+                    api_key=api_key,
+                )
+                planner_prompt = f"""
+You are a planner that translates user questions into a JSON plan to query two dataframes safely.
+Only output JSON. No prose.
+
+DataFrames:
+- summary_df (columns: {summary_cols})
+- rcm_df (columns: {rcm_cols})
+
+Derived numeric columns in summary_df:
+- _flag: 1 if 'Flag - Manual Auditor Check' is non-empty else 0
+- _critical: 1 if 'Flag - Manual Auditor Check' contains 'In Scope & not Mapped' else 0
+
+Allowed operations:
+- target: one of ['summary','rcm','both']
+- filters: array of predicates using columns above with ops in ['eq','neq','contains','in']
+- group_by: array of columns
+- metrics: array of named aggregations chosen from:
+  - total_rows: count of rows
+  - total_flags: sum(_flag) [summary only]
+  - critical_flags: sum(_critical) [summary only]
+  - sum_account_value: sum('Account Value') if present
+  - unique_entities: nunique('Entity') if present
+  - unique_controls: nunique('Control ID') if present (rcm)
+- sort: array like {"by":"<metric or column>", "desc":true|false}
+- limit: integer
+- select: optional list of columns to include in final table
+- answer_template: OPTIONAL one-line English summary referencing metric keys in curly braces
+
+Produce a single JSON object with these keys. Question: {question}
+"""
+                resp = _model.invoke([__HM(content=planner_prompt)])
+                text = str(resp.content).strip()
+                if '```json' in text:
+                    s = text.find('```json') + 7
+                    e = text.find('```', s)
+                    text = text[s:e].strip()
+                elif '```' in text:
+                    s = text.find('```') + 3
+                    e = text.find('```', s)
+                    text = text[s:e].strip()
+                plan = _json.loads(text)
+        except Exception as _e:
+            llm_error = str(_e)
+            plan = None
+
+        def _fallback_plan(q: str):
+            ql = (q or '').lower()
+            if 'in-scope' in ql or 'in scope' in ql:
+                acct = None
+                for at in sorted(df_summary.get('Account Type', _pd.Series(dtype=str)).astype(str).unique().tolist()):
+                    if at and at.lower() in ql:
+                        acct = at
+                        break
+                filters = [{"column":"Scope","op":"eq","value":"In Scope"}]
+                if acct:
+                    filters.append({"column":"Account Type","op":"eq","value":acct})
+                return {
+                    "target":"summary",
+                    "filters": filters,
+                    "group_by":["Entity"],
+                    "metrics":[{"name":"total_rows","expr":"count"}],
+                    "sort":[{"by":"Entity","desc":False}],
+                    "limit": limit,
+                    "select":["Entity","Account Type","Scope"]
+                }
+            if 'most flags' in ql or 'highest flags' in ql or 'top flags' in ql:
+                return {
+                    "target":"summary",
+                    "filters": [],
+                    "group_by":["Account Type"],
+                    "metrics":[{"name":"total_flags","expr":"sum_flag"},{"name":"critical_flags","expr":"sum_critical"}],
+                    "sort":[{"by":"total_flags","desc":True},{"by":"critical_flags","desc":True}],
+                    "limit": 10
+                }
+            if 'critical' in ql and 'flag' in ql:
+                return {
+                    "target":"summary",
+                    "filters": [],
+                    "group_by":[],
+                    "metrics":[{"name":"critical_flags","expr":"sum_critical"}],
+                    "limit": 1
+                }
+            return {
+                "target":"summary",
+                "filters": [],
+                "group_by":[],
+                "metrics":[{"name":"total_rows","expr":"count"}],
+                "limit": 1
+            }
+
+        if not plan:
+            plan = _fallback_plan(question)
+
+        # 5) Execute plan
+        target = plan.get('target','summary')
+        filters = plan.get('filters', []) or []
+        group_by = plan.get('group_by', []) or []
+        metrics = plan.get('metrics', []) or []
+        sort = plan.get('sort', []) or []
+        sel = plan.get('select', []) or []
+        lim = int(plan.get('limit', limit)) if plan.get('limit') else int(limit)
+
+        source_df = df_summary if target in ['summary','both'] else df_rcm
+        if target == 'both' and df_rcm is not None and not df_rcm.empty:
+            try:
+                common = [c for c in df_summary.columns if c in df_rcm.columns]
+                source_df = _pd.concat([df_summary[common], df_rcm[common]], ignore_index=True)
+            except Exception:
+                source_df = df_summary
+
+        if source_df is None or source_df.empty:
+            return Command(update={
+                'messages': [ToolMessage("No data available in the selected target for answering this question.", tool_call_id=tool_call_id)]
+            })
+
+        dfq = source_df.copy()
+        def _apply_filter(df, f):
+            col = f.get('column'); op = f.get('op','eq'); val = f.get('value')
+            if col not in df.columns:
+                return df
+            series = df[col].astype(str)
+            sval = str(val) if val is not None else ''
+            if op == 'eq':
+                return df[series.str.lower() == sval.lower()]
+            if op == 'neq':
+                return df[series.str.lower() != sval.lower()]
+            if op == 'contains':
+                return df[series.str.lower().str.contains(sval.lower(), na=False)]
+            if op == 'in':
+                vals = [str(x).lower() for x in (val or [])]
+                return df[series.str.lower().isin(vals)]
+            return df
+        for f in filters:
+            try:
+                dfq = _apply_filter(dfq, f)
+            except Exception:
+                pass
+
+        if group_by:
+            gb = dfq.groupby(group_by, as_index=False)
+        else:
+            gb = None
+
+        def _agg_metric(df_or_gb, m):
+            name = m.get('name','value')
+            expr = m.get('expr','count')
+            if expr == 'count':
+                val = df_or_gb.size() if gb is None else df_or_gb.size()
+                out = val
+                if isinstance(out, _pd.Series):
+                    out = out.to_frame(name)
+                else:
+                    out = _pd.DataFrame({name:[int(val)]})
+                return out
+            if expr == 'sum_flag':
+                col = '_flag'
+                base = dfq if gb is None else df_or_gb
+                try:
+                    res = (base[col].sum() if gb is None else base[col].sum().reset_index(name=name))
+                except Exception:
+                    res = _pd.DataFrame({name:[0]})
+                if isinstance(res, (int, float)):
+                    res = _pd.DataFrame({name:[int(res)]})
+                return res
+            if expr == 'sum_critical':
+                col = '_critical'
+                base = dfq if gb is None else df_or_gb
+                try:
+                    res = (base[col].sum() if gb is None else base[col].sum().reset_index(name=name))
+                except Exception:
+                    res = _pd.DataFrame({name:[0]})
+                if isinstance(res, (int, float)):
+                    res = _pd.DataFrame({name:[int(res)]})
+                return res
+            if expr == 'sum_account_value' and 'Account Value' in dfq.columns:
+                base = dfq if gb is None else df_or_gb
+                res = (base['Account Value'].sum() if gb is None else base['Account Value'].sum().reset_index(name=name))
+                if isinstance(res, (int, float)):
+                    res = _pd.DataFrame({name:[res]})
+                return res
+            if expr == 'unique_entities' and 'Entity' in dfq.columns:
+                base = dfq if gb is None else df_or_gb
+                res = (base['Entity'].nunique() if gb is None else base['Entity'].nunique().reset_index(name=name))
+                if isinstance(res, (int, float)):
+                    res = _pd.DataFrame({name:[int(res)]})
+                return res
+            if expr == 'unique_controls' and 'Control ID' in dfq.columns:
+                base = dfq if gb is None else df_or_gb
+                res = (base['Control ID'].nunique() if gb is None else base['Control ID'].nunique().reset_index(name=name))
+                if isinstance(res, (int, float)):
+                    res = _pd.DataFrame({name:[int(res)]})
+                return res
+            val = dfq.shape[0] if gb is None else df_or_gb.size().reset_index(name=name)
+            if isinstance(val, (int, float)):
+                val = _pd.DataFrame({name:[int(val)]})
+            return val
+
+        if metrics:
+            if gb is None:
+                frames = []
+                for m in metrics:
+                    dfm = _agg_metric(dfq, m)
+                    frames.append(dfm)
+                base = _pd.DataFrame()
+                for f in frames:
+                    base = _pd.concat([base.reset_index(drop=True), f.reset_index(drop=True)], axis=1)
+                result = base
+            else:
+                result = None
+                for m in metrics:
+                    dfm = _agg_metric(gb, m)
+                    if result is None:
+                        result = dfm
+                    else:
+                        result = result.merge(dfm, on=group_by, how='outer')
+        else:
+            sel_effective = sel if sel else [c for c in ['Account Type','Entity','Scope','Account Value'] if c in dfq.columns]
+            result = dfq[sel_effective] if sel_effective else dfq
+
+        if isinstance(result, _pd.DataFrame) and not result.empty and sort:
+            try:
+                by_cols = [s.get('by') for s in sort if s.get('by') in result.columns]
+                if by_cols:
+                    ascending = [not s.get('desc', True) for s in sort if s.get('by') in result.columns]
+                    result = result.sort_values(by=by_cols, ascending=ascending)
+            except Exception:
+                pass
+        if isinstance(result, _pd.DataFrame) and not result.empty and lim:
+            result = result.head(int(lim))
+
+        lines = []
+        if isinstance(result, _pd.DataFrame) and not result.empty:
+            preview_cols = list(result.columns)[:6]
+            lines.append(f"Showing {min(len(result), lim)} of {len(result)} rows")
+            if len(preview_cols) <= 2 and len(result) <= lim:
+                for _, row in result.iterrows():
+                    parts = [str(row[c]) for c in preview_cols]
+                    lines.append(f"- {' | '.join(parts)}")
+            else:
+                header = ' | '.join([str(c) for c in preview_cols])
+                lines.append(header)
+                lines.append('-' * len(header))
+                for _, row in result.iterrows():
+                    parts = [str(row[c]) for c in preview_cols]
+                    lines.append(' | '.join(parts))
+        else:
+            lines.append("No matching data found for the question.")
+
+        answer_text = None
+        template = plan.get('answer_template') if isinstance(plan, dict) else None
+        if template and isinstance(result, _pd.DataFrame) and not result.empty:
+            try:
+                row0 = result.iloc[0].to_dict()
+                answer_text = str(template).format(**{k: row0.get(k, '') for k in row0.keys()})
+            except Exception:
+                answer_text = None
+
+        msg = (answer_text + "\n\n" if answer_text else "") + "\n".join(lines)
+
+        payload = {
+            'messages': [ToolMessage(msg, tool_call_id=tool_call_id)],
+            'automation_excel_path': excel_path
+        }
+        if isinstance(result, _pd.DataFrame):
+            payload['qa_results_table'] = result.to_dict(orient='records')
+            payload['qa_results_columns'] = list(result.columns)
+            payload['qa_plan'] = plan
+            if llm_error:
+                payload['qa_planner_warning'] = llm_error
+
+        return Command(update=payload)
+
+    except Exception as e:
+        return Command(update={
+            'messages': [ToolMessage(f"Error answering results question: {str(e)}", tool_call_id=tool_call_id)]
         })
