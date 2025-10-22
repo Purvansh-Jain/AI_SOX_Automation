@@ -1558,7 +1558,6 @@ def list_in_scope_entities(
                 str(Path('ai-app') / 'Final_Automation_Report.xlsx')
             ]
             excel_path = next((p for p in candidates if p and _os.path.exists(p)), None)
-
         if not excel_path:
             return Command(update={
                 'messages': [ToolMessage(
@@ -1614,6 +1613,105 @@ def list_in_scope_entities(
     except Exception as e:
         return Command(update={
             'messages': [ToolMessage(f"Error listing in-scope entities: {str(e)}", tool_call_id=tool_call_id)]
+        })
+
+
+@tool(description="List out-of-scope entities (brands) from the generated results Excel. Optional filter by account_type.")
+def list_out_of_scope_entities(
+    state: Annotated[AnalystState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    account_type: Optional[str] = None,
+    limit: int = 100
+) -> Command:
+    """Return unique entities with Scope == 'Out of Scope' from ALL_AccountType_Summary.
+
+    Args:
+        account_type: Optional case-insensitive filter for a specific account type
+        limit: Max number of entities to list in the message (full list returned in data)
+    """
+    try:
+        import os as _os
+        import pandas as _pd
+        from pathlib import Path as _Path
+
+        excel_path = state.get('automation_excel_path') if state is not None else None
+        if not excel_path or not _os.path.exists(excel_path):
+            candidates = [
+                excel_path,
+                "Final_Automation_Report.xlsx",
+                str(_Path(__file__).resolve().parent / 'Final_Automation_Report.xlsx'),
+                str(_Path.cwd() / 'Final_Automation_Report.xlsx')
+            ]
+            excel_path = next((p for p in candidates if p and _os.path.exists(p)), None)
+
+        if not excel_path:
+            return Command(update={
+                'messages': [ToolMessage(
+                    "Results Excel not found. Please run the automation first.",
+                    tool_call_id=tool_call_id
+                )]
+            })
+
+        try:
+            df = _pd.read_excel(excel_path, sheet_name='ALL_AccountType_Summary')
+        except Exception as _e:
+            return Command(update={
+                'messages': [ToolMessage(
+                    f"Could not open ALL_AccountType_Summary from {excel_path}: {_e}",
+                    tool_call_id=tool_call_id
+                )]
+            })
+
+        if 'Entity' not in df.columns or 'Scope' not in df.columns:
+            return Command(update={
+                'messages': [ToolMessage(
+                    "Expected columns 'Scope' and 'Entity' not found in summary sheet.",
+                    tool_call_id=tool_call_id
+                )]
+            })
+
+        work = df.copy()
+        # Normalize Scope robustly: lower, replace hyphens/underscores/multiple spaces, remove NBSP
+        scope_norm = (
+            work['Scope'].astype(str)
+            .str.replace('\xa0', ' ', regex=False)
+            .str.lower()
+            .str.replace(r'[-_]+', ' ', regex=True)
+            .str.replace(r'\s+', ' ', regex=True)
+            .str.strip()
+        )
+        work = work.assign(_scope_norm=scope_norm)
+
+        if account_type and 'Account Type' in work.columns:
+            work = work[work['Account Type'].astype(str).str.lower() == str(account_type).lower()]
+
+        out_scope = work[work['_scope_norm'] == 'out of scope']
+        entities = (
+            out_scope['Entity'].dropna().astype(str).str.strip().sort_values().unique().tolist()
+        )
+
+        head = entities[: max(1, int(limit))]
+        lines = ["### Out-of-Scope Entities"]
+        if account_type:
+            lines[0] += f" — {account_type}"
+        if not entities:
+            lines.append("No entities found with Scope == 'Out of Scope'.")
+        else:
+            for i, e in enumerate(head, 1):
+                lines.append(f"{i}. {e}")
+            if len(entities) > len(head):
+                lines.append(f"… and {len(entities) - len(head)} more")
+
+        return Command(update={
+            'messages': [ToolMessage("\n".join(lines), tool_call_id=tool_call_id)],
+            'automation_excel_path': excel_path,
+            'out_of_scope_entities': entities,
+            'account_type_filter': account_type
+        })
+
+    except Exception as e:
+        return Command(update={
+            'messages': [ToolMessage(f"Error listing out-of-scope entities: {e}", tool_call_id=tool_call_id)]
         })
 
 
@@ -1769,6 +1867,18 @@ Produce a single JSON object with these keys. Question: {question}
 
         def _fallback_plan(q: str):
             ql = (q or '').lower()
+            # Common: request for raw line items/rows from the summary sheet
+            if ('line items' in ql or 'lineitems' in ql or 'line-items' in ql) and (
+                'summary' in ql or 'account type summary' in ql or 'all account type' in ql
+            ):
+                return {
+                    "target":"summary",
+                    "filters": [],
+                    "group_by": [],
+                    "metrics": [],
+                    "limit": limit,
+                    "select": [c for c in ['Account Type','Entity','Scope','Account Value','Flag - Manual Auditor Check'] if c in df_summary.columns]
+                }
             if 'in-scope' in ql or 'in scope' in ql:
                 acct = None
                 for at in sorted(df_summary.get('Account Type', _pd.Series(dtype=str)).astype(str).unique().tolist()):

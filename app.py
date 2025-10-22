@@ -60,6 +60,11 @@ except Exception:
     list_in_scope_entities = None
 
 try:
+    from tools import list_out_of_scope_entities
+except Exception:
+    list_out_of_scope_entities = None
+
+try:
     from tools import qa_results
 except Exception:
     qa_results = None
@@ -102,6 +107,8 @@ if callable(get_flag_counts_by_account_type):
     TOOLS.append(get_flag_counts_by_account_type)
 if callable(list_in_scope_entities):
     TOOLS.append(list_in_scope_entities)
+if callable(list_out_of_scope_entities):
+    TOOLS.append(list_out_of_scope_entities)
 if callable(qa_results):
     TOOLS.append(qa_results)
 
@@ -480,6 +487,73 @@ def render_results_dashboard(summary_data):
         """,
             unsafe_allow_html=True,
         )
+
+
+def _run_results_qa(question: str):
+    """Stream an agent response that prefers using qa_results to answer a results question."""
+    if not (callable(qa_results) or callable(get_flag_counts_by_account_type) or callable(list_in_scope_entities)):
+        st.info("Results Q&A tools are not available in this deployment.")
+        return
+    state = st.session_state["analyst_state"]
+    instruction = (
+        "Use qa_results to answer the following question using the generated results (Final_Automation_Report.xlsx). "
+        "Reply concisely, and include a small table when helpful. If qa_results isn't available, try other results readers.\n"
+        f"Question: {question}"
+    )
+    state["messages"].append(HumanMessage(content=instruction))
+    response_placeholder = st.empty()
+    streamed_text = ""
+    with st.spinner("Answering..."):
+        try:
+            for event in agent_executor.stream(state, config=config, stream_mode="updates"):
+                if "agent" in event:
+                    agent = event["agent"]
+                    if "messages" in agent:
+                        msg = agent["messages"][-1]
+                        if isinstance(msg, AIMessage) and msg.content:
+                            streamed_text += msg.content
+                            response_placeholder.markdown(streamed_text + "▌")
+        except Exception as e:
+            st.error(f"Q&A error: {str(e)}")
+            return
+    response_placeholder.markdown(streamed_text)
+    state["messages"].append(AIMessage(content=streamed_text))
+
+def _show_out_of_scope_entities(account_type: str | None = None, limit: int = 100):
+    """Deterministically load the results Excel and display Out-of-Scope entities, bypassing the agent."""
+    try:
+        state = st.session_state["analyst_state"]
+        excel_path = state.get("automation_excel_path")
+        if not excel_path or not os.path.exists(excel_path):
+            # fallback to common filename in this app folder
+            candidate = Path(__file__).resolve().parent / "Final_Automation_Report.xlsx"
+            if candidate.exists():
+                excel_path = str(candidate)
+        if not excel_path:
+            st.info("Results Excel not found. Please run the automation first.")
+            return
+        df = pd.read_excel(excel_path, sheet_name="ALL_AccountType_Summary")
+        if "Scope" not in df.columns or "Entity" not in df.columns:
+            st.info("Expected columns 'Scope' and 'Entity' not found in summary sheet.")
+            return
+        work = df.copy()
+        if account_type and "Account Type" in work.columns:
+            work = work[work["Account Type"].astype(str).str.lower() == str(account_type).lower()]
+        out_scope = work[work["Scope"].astype(str).str.strip().str.lower() == "out of scope"]
+        entities = (
+            out_scope["Entity"].dropna().astype(str).sort_values().unique().tolist()
+        )
+        st.markdown("#### Out-of-Scope Entities" + (f" — {account_type}" if account_type else ""))
+        if not entities:
+            st.write("No entities found with Scope == 'Out of Scope'.")
+            return
+        head = entities[: max(1, int(limit))]
+        for i, e in enumerate(head, 1):
+            st.write(f"{i}. {e}")
+        if len(entities) > len(head):
+            st.caption(f"… and {len(entities) - len(head)} more")
+    except Exception as e:
+        st.error(f"Could not list out-of-scope entities: {e}")
 
 
 # Sidebar workflow and file status
@@ -923,29 +997,71 @@ elif st.session_state["workflow_stage"] == "complete":
                                 if isinstance(msg, AIMessage) and msg.content:
                                     st.markdown(msg.content)
                                     state["messages"].append(msg)
-    if st.button("🔄 Run New Analysis", width='stretch'):
+        # Results Q&A panel
+        st.markdown("### 💬 Results Q&A")
+        qa_col1 = st.container()
+        # Load account types for convenience filters
+        acct_options = ["(All)"]
+        try:
+            if state.get("automation_excel_path"):
+                _df_tmp = pd.read_excel(state["automation_excel_path"], sheet_name="ALL_AccountType_Summary")
+                if "Account Type" in _df_tmp.columns:
+                    acct_values = sorted(_df_tmp["Account Type"].dropna().astype(str).unique().tolist())
+                    acct_options = ["(All)"] + acct_values
+        except Exception:
+            pass
+        with qa_col1:
+            st.caption("Quick asks")
+            # Global question (not tied to the Account Type filter)
+            if st.button("Which account types have the most flags?", use_container_width=True):
+                _run_results_qa("Which account types have the most flags? Show totals and critical flags.")
+            # Global in-scope list
+            if st.button("List all in-scope entities (brands)", use_container_width=True):
+                _run_results_qa("List all unique entities that are In Scope.")
+            # Per-account-type helpers
+            sel_acct = st.selectbox(
+                "Filter entities by Account Type",
+                options=acct_options,
+                index=0,
+                key="qa_sel_acct",
+            )
+            if st.button("List in-scope entities for selection", use_container_width=True):
+                if sel_acct and sel_acct != "(All)":
+                    _run_results_qa(f"List in-scope entities (brands) for account type '{sel_acct}'.")
+                else:
+                    _run_results_qa("List all unique entities that are In Scope.")
+            if st.button("Which entities are out of scope for this account type?", use_container_width=True):
+                # Deterministic helper filtered by the selected account type (if any)
+                _show_out_of_scope_entities(None if sel_acct == "(All)" else sel_acct)
+        if st.button("🔄 Run New Analysis", width='stretch'):
             st.session_state["workflow_stage"] = "files_uploaded"
             st.rerun()
 
 # Chat input (always available)
 if user_input := st.chat_input("Ask me anything about SOX automation..."):
     state = st.session_state["analyst_state"]
-    state["messages"].append(HumanMessage(content=user_input))
     with st.chat_message("user", avatar="👤"):
         st.markdown(user_input)
-    with st.chat_message("assistant", avatar="🤖"):
-        response_placeholder = st.empty()
-        streamed_text = ""
-        try:
-            for event in agent_executor.stream(state, config=config, stream_mode="updates"):
-                if "agent" in event:
-                    agent = event["agent"]
-                    if "messages" in agent:
-                        msg = agent["messages"][-1]
-                        if isinstance(msg, AIMessage) and msg.content:
-                            streamed_text += msg.content
-                            response_placeholder.markdown(streamed_text + "▌")
-            response_placeholder.markdown(streamed_text)
-            state["messages"].append(AIMessage(content=streamed_text))
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
+    # Prefer results-grounded answers when the Excel exists or qa_results is available
+    results_available = bool(state.get("automation_excel_path")) or Path(__file__).resolve().parent.joinpath("Final_Automation_Report.xlsx").exists()
+    if callable(qa_results) and results_available:
+        with st.chat_message("assistant", avatar="🤖"):
+            _run_results_qa(user_input)
+    else:
+        state["messages"].append(HumanMessage(content=user_input))
+        with st.chat_message("assistant", avatar="🤖"):
+            response_placeholder = st.empty()
+            streamed_text = ""
+            try:
+                for event in agent_executor.stream(state, config=config, stream_mode="updates"):
+                    if "agent" in event:
+                        agent = event["agent"]
+                        if "messages" in agent:
+                            msg = agent["messages"][-1]
+                            if isinstance(msg, AIMessage) and msg.content:
+                                streamed_text += msg.content
+                                response_placeholder.markdown(streamed_text + "▌")
+                response_placeholder.markdown(streamed_text)
+                state["messages"].append(AIMessage(content=streamed_text))
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
