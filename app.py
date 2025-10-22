@@ -46,10 +46,23 @@ from tools import (
     detect_anomalies,
     generate_executive_summary,
     discover_relevant_controls,
-    get_flag_counts_by_account_type,
-    list_in_scope_entities,
-    qa_results,
 )
+
+# Optional Q&A readers (backward compatible on older deployments)
+try:
+    from tools import get_flag_counts_by_account_type
+except Exception:
+    get_flag_counts_by_account_type = None
+
+try:
+    from tools import list_in_scope_entities
+except Exception:
+    list_in_scope_entities = None
+
+try:
+    from tools import qa_results
+except Exception:
+    qa_results = None
 from models import AnalystState
 import pandas as pd
 
@@ -82,8 +95,15 @@ TOOLS = [
     update_trail_balance_file_path, analyze_data, get_columns,
     run_sox_automation, suggest_control_mappings, detect_anomalies,
     generate_executive_summary, discover_relevant_controls,
-    get_flag_counts_by_account_type, list_in_scope_entities, qa_results,
 ]
+
+# Append optional tools if present (avoids import errors on minimal forks)
+if callable(get_flag_counts_by_account_type):
+    TOOLS.append(get_flag_counts_by_account_type)
+if callable(list_in_scope_entities):
+    TOOLS.append(list_in_scope_entities)
+if callable(qa_results):
+    TOOLS.append(qa_results)
 
 config = {"configurable": {"thread_id": "1"}}
 
