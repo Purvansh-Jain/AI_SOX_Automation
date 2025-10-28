@@ -1120,6 +1120,7 @@ def run_sox_automation(
         all_entity_summaries = []
         all_matched_controls = []
         individual_results = []
+        all_matched_control_ids = set()  # Track which control IDs were matched
         
         # Track metrics for executive summary
         total_flags = 0
@@ -1170,6 +1171,8 @@ def run_sox_automation(
             if not matched_controls.empty:
                 matched_controls['Mapped Process Group'] = matched_controls['Control ID'].apply(_map_control_id_to_process)
                 total_controls_mapped += len(matched_controls)
+                # Track which control IDs were matched
+                all_matched_control_ids.update(matched_controls['Control ID'].dropna().unique().tolist())
             else:
                 matched_controls = pd.DataFrame(columns=rcm.columns.tolist() + ['Mapped Process Group'])
 
@@ -1335,8 +1338,36 @@ def run_sox_automation(
             # --- Consolidated RCM ---
             if all_matched_controls:
                 df_rcm_consolidated = pd.concat(all_matched_controls, ignore_index=True, sort=False)
+                # Deduplicate to keep only unique control IDs (keep first occurrence)
+                df_rcm_consolidated = df_rcm_consolidated.drop_duplicates(subset=['Control ID'], keep='first').reset_index(drop=True)
                 sheet_name = 'ALL_RCM_Combined'
                 _write_df_with_formats(df_rcm_consolidated, sheet_name)
+                print(f"DEBUG: ✅ Created ALL_RCM_Combined with {len(df_rcm_consolidated)} unique controls")
+
+            # --- Unmapped Controls Diagnostic Sheet (right after consolidated sheets) ---
+            try:
+                # Find controls that were NOT matched to any account type
+                all_rcm_control_ids = set(rcm['Control ID'].dropna().unique().tolist())
+                unmapped_control_ids = all_rcm_control_ids - all_matched_control_ids
+                
+                if unmapped_control_ids:
+                    # Get the unmapped controls details
+                    unmapped_df = rcm[rcm['Control ID'].isin(unmapped_control_ids)].copy()
+                    unmapped_df = unmapped_df.drop_duplicates(subset=['Control ID'], keep='first').reset_index(drop=True)
+                    unmapped_df['Reason'] = 'GPT-4 + Synonym Matching Failed'
+                    
+                    # Reorder columns with Reason first
+                    reason_cols = ['Reason'] + [c for c in unmapped_df.columns if c not in ['Reason']]
+                    unmapped_df = unmapped_df[reason_cols]
+                    
+                    sheet_name = 'Unmapped_Controls'
+                    _write_df_with_formats(unmapped_df, sheet_name)
+                    print(f"DEBUG: ✅ Created Unmapped_Controls sheet with {len(unmapped_df)} controls")
+                else:
+                    print(f"DEBUG: ✅ All controls were successfully matched!")
+                    
+            except Exception as e:
+                print(f"DEBUG: ⚠️ Could not create unmapped controls sheet: {e}")
 
             # --- Individual sheets ---
             for acc, df_summary, df_rcm in individual_results:

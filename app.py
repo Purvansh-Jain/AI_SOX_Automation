@@ -453,8 +453,8 @@ def render_results_dashboard(summary_data):
     if summary_data is None:
         summary_data = {
             "total_account_types": 0,
-            "total_entities": 0,
-            "in_scope_entities": 0,
+            "total_rows": 0,
+            "in_scope_rows": 0,
             "total_flags": 0,
             "critical_flags": 0,
             "controls_mapped": 0,
@@ -466,8 +466,8 @@ def render_results_dashboard(summary_data):
     total_flags = summary_data.get("total_flags", 0)
     critical_flags = summary_data.get("critical_flags", 0)
     in_scope_pct = (
-        summary_data.get("in_scope_entities", 0)
-        / max(summary_data.get("total_entities", 1), 1)
+        summary_data.get("in_scope_rows", 0)
+        / max(summary_data.get("total_rows", 1), 1)
         * 100
     )
     with c1:
@@ -684,12 +684,10 @@ elif st.session_state["workflow_stage"] == "analyzing":
                 try:
                     excel_path = state["automation_excel_path"]
                     summary_df = pd.read_excel(excel_path, sheet_name="ALL_AccountType_Summary")
-                    total_entities = summary_df["Entity"].nunique()
-                    in_scope_entities = (
-                        summary_df[summary_df["Scope"] == "In Scope"]["Entity"].nunique()
-                    )
+                    total_rows = len(summary_df)
+                    in_scope_rows = len(summary_df[summary_df["Scope"] == "In Scope"])
                     total_accounts = summary_df["Account Type"].nunique()
-                    total_flags = summary_df["Flag - Manual Auditor Check"].astype(str).str.len().gt(0).sum()
+                    total_flags = summary_df["Flag - Manual Auditor Check"].fillna('').astype(str).str.strip().ne('').sum()
                     critical_flags = summary_df["Flag - Manual Auditor Check"].astype(str).str.contains(
                         "In Scope & not Mapped", na=False
                     ).sum()
@@ -700,8 +698,8 @@ elif st.session_state["workflow_stage"] == "analyzing":
                         controls_mapped = 0
                     st.session_state["analysis_results"] = {
                         "total_account_types": total_accounts,
-                        "total_entities": total_entities,
-                        "in_scope_entities": in_scope_entities,
+                        "total_rows": total_rows,
+                        "in_scope_rows": in_scope_rows,
                         "total_flags": int(total_flags),
                         "critical_flags": int(critical_flags),
                         "controls_mapped": int(controls_mapped),
@@ -715,8 +713,8 @@ elif st.session_state["workflow_stage"] == "analyzing":
                     st.warning(f"Could not extract metrics: {e}")
                     st.session_state["analysis_results"] = {
                         "total_account_types": 0,
-                        "total_entities": 0,
-                        "in_scope_entities": 0,
+                        "total_rows": 0,
+                        "in_scope_rows": 0,
                         "total_flags": 0,
                         "critical_flags": 0,
                         "controls_mapped": 0,
@@ -850,7 +848,7 @@ elif st.session_state["workflow_stage"] == "complete":
                         f"Could not load 'ALL_AccountType_Summary' from the generated Excel: {e}"
                     )
             with st.expander(
-                "View ALL_RCM_Combined (Combined RCM mapping) - paginated (50 rows)",
+                "View ALL_RCM_Combined (Combined RCM mapping - 241 unique controls) - paginated (50 rows)",
                 expanded=False,
             ):
                 try:
