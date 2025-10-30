@@ -85,9 +85,9 @@ def _gpt4_match_controls(account_type: str, rcm_df: pd.DataFrame, model) -> pd.D
     # Get all controls
     controls = rcm_df[['Control ID', 'Control Description']].copy()
     
-    # Prepare batch analysis prompt
+    # Prepare batch analysis prompt - safely handle NaN/None values
     controls_text = "\n".join([
-        f"{idx+1}. {row['Control ID']}: {row['Control Description'][:200]}"
+        f"{idx+1}. {row['Control ID']}: {str(row['Control Description'])[:200] if pd.notna(row['Control Description']) else '(No description)'}"
         for idx, row in controls.iterrows()
     ])
     
@@ -266,15 +266,50 @@ def _ai_match_controls(account_type: str, rcm_df: pd.DataFrame, use_ai: bool = T
         'Fixed Assets': ['fixed assets', 'pp&e', 'ppe', 'property plant', 'capital asset'],
         'Goodwill': ['goodwill'],
         'Intangibles': ['intangible', 'intangibles'],
-        'Equity': ['equity', 'stockholder', 'shareholder', 'stock'],
-        'Accrued Expenses': ['accrued expenses', 'accrued expense', 'accrual'],
+        'Equity': ['equity', 'stockholder', 'shareholder', 'stock', 'deficit', 'retained earnings'],
+        'Accrued Expenses': ['accrued expenses', 'accrued expense', 'accrual', 'current liabilities', 'other current liabilities'],
     }
     
-    search_terms = ACCOUNT_TYPE_SYNONYMS.get(account_type, [account_type.lower()])
+    # Expand dictionary dynamically based on the actual account type name
+    # This helps match variations like "Accrued expenses and other current liabilities"
+    expanded_synonyms = {}
+    for key, synonyms in ACCOUNT_TYPE_SYNONYMS.items():
+        expanded_synonyms[key] = synonyms
+    
+    # Check if account_type closely matches any existing key
+    account_type_lower = account_type.lower()
+    account_type_words = set(account_type_lower.replace(',', '').split())
+    
+    # Find best matching synonym group by word overlap
+    best_match_key = None
+    best_match_score = 0
+    
+    for key, synonyms in ACCOUNT_TYPE_SYNONYMS.items():
+        # Calculate word overlap
+        all_words = set()
+        for syn in synonyms:
+            all_words.update(syn.split())
+        
+        overlap = len(account_type_words.intersection(all_words))
+        if overlap > best_match_score:
+            best_match_score = overlap
+            best_match_key = key
+    
+    # Use the best matching synonym group if we found a good match
+    if best_match_score >= 1 and best_match_key:
+        search_terms = ACCOUNT_TYPE_SYNONYMS[best_match_key]
+        print(f"  💡 Mapped '{account_type}' to synonym group '{best_match_key}' (overlap: {best_match_score} words)")
+    else:
+        # Use the account type name itself and extract key terms
+        search_terms = [account_type.lower()]
+        # Extract individual words as additional search terms (length > 3 to avoid noise)
+        search_terms.extend([w for w in account_type_lower.replace(',', '').split() if len(w) > 3])
     
     # Build regex pattern with word boundaries
     import re
     pattern = '|'.join([rf'\b{re.escape(term)}\b' for term in search_terms])
+    
+    print(f"  🔍 Searching with terms: {search_terms[:5]}{'...' if len(search_terms) > 5 else ''}")
     
     synonym_controls = rcm_df[rcm_df['Control Description'].astype(str).str.lower().str.contains(pattern, na=False, regex=True)].copy()
     
