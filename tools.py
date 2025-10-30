@@ -322,7 +322,7 @@ def _ai_match_controls(account_type: str, rcm_df: pd.DataFrame, use_ai: bool = T
         
         # Accounts Payable
         'Accounts Payable': [
-            'accounts payable', 'payable', 'payables', 'ap', 'a/p',
+            'accounts payable', 'payable', 'payables', 'ap', 'a/p', 'AP'
             'trade payable', 'vendor payable', 'trade creditors', 'creditors',
             'vouchers payable', 'amounts due'
         ],
