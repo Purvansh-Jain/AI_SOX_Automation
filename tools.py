@@ -254,20 +254,207 @@ def _ai_match_controls(account_type: str, rcm_df: pd.DataFrame, use_ai: bool = T
     # TIER 2: SYNONYM-BASED MATCHING (comprehensive keyword coverage)
     print(f"  [Hybrid Mode: Step 2 - Synonym matching for '{account_type}']")
     
+    # Comprehensive synonym dictionary for account type matching
+    # Organized by financial statement category for better semantic relationships
     ACCOUNT_TYPE_SYNONYMS = {
-        'Cash Summary': ['cash summary', 'cash', 'bank', 'treasury'],
-        'Accrued Credits': ['accrued credits', 'accrued credit', 'credit', 'deferred'],
-        'Payroll Accrual': ['payroll accrual', 'payroll', 'compensation', 'salary', 'wages', 'employee'],
-        'Taxes Payable': ['taxes payable', 'tax', 'income tax', 'vat', 'withholding'],
-        'Accounts Receivable': ['accounts receivable', 'receivable', 'ar ', 'customer receivable', 'trade receivable'],
-        'Accounts Payable': ['accounts payable', 'payable', 'ap ', 'vendor payable', 'trade payable'],
-        'Debt': ['debt', 'loan', 'borrowing', 'note payable', 'interest'],
-        'Inventory': ['inventory', 'stock', 'cost of revenues'],
-        'Fixed Assets': ['fixed assets', 'pp&e', 'ppe', 'property plant', 'capital asset'],
-        'Goodwill': ['goodwill'],
-        'Intangibles': ['intangible', 'intangibles'],
-        'Equity': ['equity', 'stockholder', 'shareholder', 'stock', 'deficit', 'retained earnings'],
-        'Accrued Expenses': ['accrued expenses', 'accrued expense', 'accrual', 'current liabilities', 'other current liabilities'],
+        # === BALANCE SHEET - ASSETS ===
+        
+        # Cash and Cash Equivalents
+        'Cash and Cash Equivalents': [
+            'cash', 'cash and cash equivalents', 'cash summary', 'bank', 'treasury', 
+            'cash on hand', 'petty cash', 'checking', 'savings', 'money market',
+            'cash equivalents', 'liquid assets', 'cash balance'
+        ],
+        
+        # Accounts Receivable
+        'Accounts Receivable': [
+            'accounts receivable', 'receivable', 'receivables', 'ar', 'a/r',
+            'trade receivable', 'customer receivable', 'trade debtors', 'debtors',
+            'unbilled receivable', 'billed receivable', 'allowance for doubtful',
+            'bad debt', 'receivable net', 'net receivables'
+        ],
+        
+        # Inventory
+        'Inventory': [
+            'inventory', 'inventories', 'stock', 'finished goods', 'raw materials',
+            'work in progress', 'wip', 'merchandise', 'goods', 'cost of revenues',
+            'inventory reserve', 'obsolete inventory', 'inventory valuation'
+        ],
+        
+        # Prepaid Expenses and Other Current Assets
+        'Prepaid Expenses': [
+            'prepaid', 'prepaid expenses', 'prepaid expense', 'prepayment',
+            'deferred cost', 'deferred charge', 'prepaid insurance', 'prepaid rent',
+            'other current assets', 'other current asset', 'current assets'
+        ],
+        
+        # Property, Plant & Equipment (PP&E)
+        'Fixed Assets': [
+            'fixed assets', 'fixed asset', 'ppe', 'pp&e', 'property plant equipment',
+            'property plant and equipment', 'tangible assets', 'capital assets',
+            'buildings', 'machinery', 'equipment', 'furniture', 'fixtures',
+            'leasehold improvement', 'capital expenditure', 'capex',
+            'accumulated depreciation', 'depreciation', 'net book value'
+        ],
+        
+        # Intangible Assets
+        'Intangible Assets': [
+            'intangible', 'intangibles', 'intangible assets', 'intangible asset',
+            'patents', 'trademarks', 'copyrights', 'licenses', 'software',
+            'customer relationships', 'customer lists', 'technology',
+            'intellectual property', 'amortization', 'capitalized software'
+        ],
+        
+        # Goodwill
+        'Goodwill': [
+            'goodwill', 'acquisition goodwill', 'impairment', 'goodwill impairment'
+        ],
+        
+        # Investments and Long-term Assets
+        'Investments': [
+            'investments', 'investment', 'marketable securities', 'securities',
+            'equity method investment', 'equity investment', 'long-term investment',
+            'short-term investment', 'available for sale', 'held to maturity',
+            'trading securities', 'cost method investment'
+        ],
+        
+        # === BALANCE SHEET - LIABILITIES ===
+        
+        # Accounts Payable
+        'Accounts Payable': [
+            'accounts payable', 'payable', 'payables', 'ap', 'a/p',
+            'trade payable', 'vendor payable', 'trade creditors', 'creditors',
+            'vouchers payable', 'amounts due'
+        ],
+        
+        # Accrued Expenses and Other Current Liabilities
+        'Accrued Expenses': [
+            'accrued expenses', 'accrued expense', 'accrual', 'accruals',
+            'accrued liabilities', 'accrued liability', 'expense accrual',
+            'current liabilities', 'current liability', 'other current liabilities',
+            'other current liability', 'accrued compensation', 'accrued bonus',
+            'accrued interest', 'accrued taxes', 'accrued utilities'
+        ],
+        
+        # Accrued Credits / Deferred Revenue
+        'Deferred Revenue': [
+            'deferred revenue', 'deferred revenues', 'unearned revenue',
+            'unearned income', 'advance payment', 'customer deposit',
+            'accrued credits', 'accrued credit', 'deferred income',
+            'contract liability', 'billings in excess'
+        ],
+        
+        # Debt and Borrowings
+        'Debt': [
+            'debt', 'loan', 'loans', 'borrowing', 'borrowings', 'note payable',
+            'notes payable', 'long-term debt', 'short-term debt', 'current debt',
+            'line of credit', 'revolving credit', 'term loan', 'bonds payable',
+            'senior debt', 'subordinated debt', 'credit facility', 'interest payable',
+            'lease liability', 'finance lease', 'capital lease'
+        ],
+        
+        # Payroll and Compensation Liabilities
+        'Payroll Liabilities': [
+            'payroll', 'payroll accrual', 'payroll liability', 'payroll liabilities',
+            'compensation', 'salaries payable', 'salary', 'wages', 'wages payable',
+            'employee benefits', 'benefits payable', 'pension', 'pension liability',
+            '401k', 'retirement plan', 'stock compensation', 'bonus accrual',
+            'vacation accrual', 'pto', 'paid time off', 'severance'
+        ],
+        
+        # Tax Liabilities
+        'Taxes Payable': [
+            'taxes payable', 'tax payable', 'tax', 'taxes', 'tax liability',
+            'income tax', 'income taxes', 'income tax payable', 'tax provision',
+            'deferred tax', 'deferred tax liability', 'deferred tax asset',
+            'vat', 'sales tax', 'withholding', 'withholding tax', 'payroll tax',
+            'property tax', 'franchise tax', 'state tax', 'federal tax'
+        ],
+        
+        # === BALANCE SHEET - EQUITY ===
+        
+        # Stockholders' Equity
+        'Equity': [
+            'equity', 'stockholders equity', "shareholders' equity", "stockholder's equity",
+            'shareholder', 'stockholder', 'stock', 'common stock', 'preferred stock',
+            'capital stock', 'paid in capital', 'additional paid in capital', 'apic',
+            'retained earnings', 'accumulated deficit', 'deficit',
+            'accumulated other comprehensive', 'aoci', 'treasury stock',
+            'contributed capital', 'share capital', 'earnings'
+        ],
+        
+        # === INCOME STATEMENT - REVENUE ===
+        
+        # Revenue
+        'Revenue': [
+            'revenue', 'revenues', 'sales', 'sale', 'income', 'net sales',
+            'gross sales', 'product revenue', 'service revenue', 'subscription revenue',
+            'licensing revenue', 'royalty', 'royalties', 'commission', 'commissions',
+            'turnover', 'top line', 'contract revenue'
+        ],
+        
+        # === INCOME STATEMENT - EXPENSES ===
+        
+        # Cost of Revenue / COGS
+        'Cost of Revenue': [
+            'cost of revenue', 'cost of revenues', 'cost of sales', 'cost of goods sold',
+            'cogs', 'cos', 'direct cost', 'direct costs', 'cost of service',
+            'production cost', 'manufacturing cost', 'cost of product'
+        ],
+        
+        # Operating Expenses
+        'Operating Expenses': [
+            'operating expenses', 'operating expense', 'opex', 'sg&a', 'sga',
+            'selling general administrative', 'general and administrative', 'g&a',
+            'overhead', 'operating cost', 'operating costs'
+        ],
+        
+        # Research & Development
+        'Research and Development': [
+            'research and development', 'r&d', 'r & d', 'research', 'development',
+            'product development', 'innovation', 'r&d expense'
+        ],
+        
+        # Sales and Marketing
+        'Sales and Marketing': [
+            'sales and marketing', 'sales', 'marketing', 'sales expense',
+            'marketing expense', 'advertising', 'promotion', 'sales commission',
+            'customer acquisition', 'sales operations'
+        ],
+        
+        # Interest Expense
+        'Interest Expense': [
+            'interest expense', 'interest', 'interest cost', 'interest paid',
+            'finance cost', 'finance charge', 'borrowing cost', 'debt service'
+        ],
+        
+        # Depreciation and Amortization
+        'Depreciation and Amortization': [
+            'depreciation', 'amortization', 'depreciation and amortization',
+            'd&a', 'depreciation expense', 'amortization expense', 'impairment'
+        ],
+        
+        # === OTHER / SPECIAL ITEMS ===
+        
+        # Derivatives and Hedging
+        'Derivatives': [
+            'derivative', 'derivatives', 'hedge', 'hedging', 'swap', 'forward',
+            'option', 'futures', 'collar', 'foreign exchange', 'fx', 'currency'
+        ],
+        
+        # Restructuring and Special Charges
+        'Restructuring': [
+            'restructuring', 'restructure', 'special charge', 'special charges',
+            'one-time', 'non-recurring', 'unusual', 'severance', 'impairment',
+            'asset write-down', 'write-down', 'write-off'
+        ],
+        
+        # Contingencies and Commitments
+        'Contingencies': [
+            'contingency', 'contingencies', 'contingent liability', 'commitment',
+            'commitments', 'litigation', 'legal', 'warranty', 'warranties',
+            'guarantee', 'indemnification', 'loss contingency'
+        ],
     }
     
     # Expand dictionary dynamically based on the actual account type name
@@ -935,7 +1122,6 @@ def get_flag_counts_by_account_type(
 
         return Command(update={
             'messages': [ToolMessage(msg, tool_call_id=tool_call_id)],
-            'automation_excel_path': excel_path,
             'flag_counts_by_account_type': top.to_dict(orient='records')
         })
 
@@ -1671,7 +1857,6 @@ def list_in_scope_entities(
 
         return Command(update={
             'messages': [ToolMessage(msg, tool_call_id=tool_call_id)],
-            'automation_excel_path': excel_path,
             'in_scope_entities': entities_sorted,
             'in_scope_entities_count': count
         })
@@ -1770,7 +1955,6 @@ def list_out_of_scope_entities(
 
         return Command(update={
             'messages': [ToolMessage("\n".join(lines), tool_call_id=tool_call_id)],
-            'automation_excel_path': excel_path,
             'out_of_scope_entities': entities,
             'account_type_filter': account_type
         })
@@ -2158,8 +2342,7 @@ Produce a single JSON object with these keys. Question: {question}
         msg = (answer_text + "\n\n" if answer_text else "") + "\n".join(lines)
 
         payload = {
-            'messages': [ToolMessage(msg, tool_call_id=tool_call_id)],
-            'automation_excel_path': excel_path
+            'messages': [ToolMessage(msg, tool_call_id=tool_call_id)]
         }
         if isinstance(result, _pd.DataFrame):
             payload['qa_results_table'] = result.to_dict(orient='records')
